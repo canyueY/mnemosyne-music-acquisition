@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Music Acquisition Monitor</title>
+  <style>
+    :root {
+      --bg: #12151c;
+      --panel: #1a2030;
+      --text: #e8ecf4;
+      --muted: #8b95a8;
+      --ok: #3ecf8e;
+      --bad: #f07178;
+      --line: #2a3348;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.5 "Segoe UI", "PingFang SC", sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #243055 0%, var(--bg) 55%);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 24px;
+    }
+    h1 { font-size: 1.35rem; font-weight: 650; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin-bottom: 20px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px 16px;
+      min-width: 200px;
+      flex: 1;
+    }
+    .card h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 8px; }
+    .val { font-size: 1.25rem; font-weight: 600; }
+    .ok { color: var(--ok); }
+    .bad { color: var(--bad); }
+    pre {
+      background: #0d1017;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 55vh;
+      font-size: 12px;
+    }
+    button {
+      background: #2d6cdf;
+      color: white;
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 14px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover { filter: brightness(1.08); }
+    .err { color: var(--bad); margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Music Acquisition Monitor</h1>
+  <p class="sub">最小运维页 · 读 <code>/api/music/v1/monitor/snapshot</code> · 不写 likes</p>
+  <div class="row">
+    <div class="card"><h2>Version</h2><div class="val" id="ver">—</div></div>
+    <div class="card"><h2>Auth</h2><div class="val" id="auth">—</div></div>
+    <div class="card"><h2>Outbox pending</h2><div class="val" id="outbox">—</div></div>
+    <div class="card"><h2>User anchor</h2><div class="val" id="anchor">—</div></div>
+    <div class="card"><h2>Bank</h2><div class="val" id="bank">—</div></div>
+  </div>
+  <p><button type="button" id="refresh">刷新</button> <span class="err" id="err"></span></p>
+  <pre id="raw">loading…</pre>
+  <script>
+    async function load() {
+      const err = document.getElementById("err");
+      err.textContent = "";
+      try {
+        const r = await fetch("/api/music/v1/monitor/snapshot");
+        const j = await r.json();
+        document.getElementById("ver").textContent = j.version || "—";
+        const st = (j.auth && (j.auth.status || j.auth.auth_status)) || "—";
+        const authEl = document.getElementById("auth");
+        authEl.textContent = st;
+        authEl.className = "val " + (/valid|authorized/i.test(st) ? "ok" : "bad");
+        document.getElementById("outbox").textContent = String(j.outbox_pending ?? "—");
+        document.getElementById("anchor").textContent = j.user_anchor_id || "(none)";
+        const bk = j.memory_bank || {};
+        const bankEl = document.getElementById("bank");
+        bankEl.textContent = (bk.kind || "?") + (bk.ok ? " ✓" : " ✗");
+        bankEl.className = "val " + (bk.ok ? "ok" : "bad");
+        document.getElementById("raw").textContent = JSON.stringify(j, null, 2);
+      } catch (e) {
+        err.textContent = String(e);
+      }
+    }
+    document.getElementById("refresh").onclick = load;
+    load();
+    setInterval(load, 15000);
+  </script>
+</body>
+</html>

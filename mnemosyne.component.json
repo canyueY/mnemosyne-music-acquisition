@@ -1,0 +1,47 @@
+{
+  "component_id": "mnemosyne.music-acquisition",
+  "name": "Mnemosyne Music Acquisition",
+  "version": "0.4.1",
+  "type": "provider",
+  "provider": "official",
+  "interfaces": {
+    "provides": [
+      "music.auth",
+      "music.acquisition",
+      "music.sync",
+      "music.snapshots",
+      "music.playback.optional",
+      "music.memory.submit",
+      "music.domain.pack"
+    ],
+    "requires": [
+      "host.runtime",
+      "mnemosyne.service.optional"
+    ]
+  },
+  "protocols": ["mnemosyne-component-v1", "music-acquisition-v1"],
+  "permissions": [
+    "music.read.liked_songs",
+    "music.read.playlists",
+    "music.read.daily_recommendations",
+    "music.read.history",
+    "music.submit.evidence",
+    "music.play"
+  ],
+  "domain_packs": [
+    "domain/music_domain_pack.v1.json"
+  ],
+  "compatibility": {
+    "mnemosyne": ">=2.0.0"
+  },
+  "lifecycle": {
+    "health_check": true,
+    "config_schema": true
+  },
+  "entry": {
+    "package": "music_acquisition",
+    "cli": "mnemosyne-music",
+    "http": "/api/music/v1"
+  },
+  "notes": "Install registers Music Domain ontology only; user music sync requires separate authorize + scopes."
+}
