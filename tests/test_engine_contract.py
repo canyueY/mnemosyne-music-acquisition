@@ -26,7 +26,7 @@ class EngineContractTests(unittest.TestCase):
     def test_initialize_without_dsh(self) -> None:
         st = asyncio.run(self.engine.initialize())
         self.assertTrue(st.ok)
-        self.assertEqual(st.version, "0.4.1")
+        self.assertEqual(st.version, "0.4.2")
         self.assertTrue(st.capabilities.features.get("likedSongs"))
         self.assertEqual(st.host, "in_memory")
 

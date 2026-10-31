@@ -26,9 +26,17 @@ Pack 文件：[`domain/music_domain_pack.v1.json`](../domain/music_domain_pack.v
 
 注册 API：
 
-- `POST /api/v1/domains/register` — `{ "pack_path" }` 或 `{ "pack": {...} }` 或排空 pending
-- `GET /api/v1/domains/{domain_id}` — 读 `domain:{id}` schema
-- 组件安装：manifest `domain_packs` → pending → install 响应里 `domain_pack_registration`
+- `POST /api/v1/domains/register` — **优先** `{ "pack": {...} }`（组件本地读入后 inline）；`pack_path` 仅作同机提示，Node 读不到宿主路径时会失败
+- `GET /api/v1/domains/{domain_id}` — 读 `domain:{id}` schema（注册后校验）
+- 组件安装：manifest `domain_packs` → pending → install 响应里 `domain_pack_registration`（**DSH 插件未发布时不走此路径**）
+- 若 Node 返回 404：客户端报 `domains_register_unsupported`，bootstrap `ok=false`
+
+检索 API（组件侧）：
+
+- **正确**：`POST /api/v1/memories/search` + `SearchQuery.domain`
+- **错误（已修）**：`POST /api/v1/search` → 404
+- 客户端在响应 `items` 上按 `metadata.domain` 二次过滤（Node 忽略 domain 时仍可用）
+
 
 ## 3. 事实 / 行为 / 推断（三层）
 

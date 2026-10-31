@@ -1,6 +1,15 @@
 # Changelog
 
+## 0.4.2
+
+- **P0 契约修复**：搜索改为 `POST /api/v1/memories/search`（不再打错误的 `/api/v1/search`）；客户端仍传 `domain` 并按 `metadata.domain` 二次过滤
+- Domain Pack：本地加载后 **inline** 提交；Node 缺路由时返回诚实错误 `domains_register_unsupported`；bootstrap 在 Mnemosyne 配置下要求 `domain_ok`
+- revoke / recall / reject / unconfirm 共用修复后的 search；revoke 按 `(track_id)` 匹配 supersede
+- `doctor` 增加 `mnemosyne_contract` 探针；契约单测 `test_mnemosyne_contract_paths`
+- 文档：ARCHITECTURE / GA / README 成熟度表述对齐（Beta，非 GA；DSH 为占位）
+
 ## 0.4.1
+
 
 - 显式 `unconfirm-like`（撕 likes / 不动 saves）；口令「取消确认喜欢」
 - 收藏歌手：weapi `artist/sublist` + collector `favorite_artists` + `probe-artists`

@@ -89,20 +89,31 @@ def apply_revokes(
                 },
             }
         )
-        # Search for observed save memory to supersede
-        search = bank.search(f"收藏了歌曲 {tid}", limit=5, domain="music")
+        # Search observed save memories to supersede.
+        # Graph content looks like: [music:observed] …收藏了歌曲《title》(tid)
+        # Prefer target_id match; fall back to tid substring hits.
+        search = bank.search(f"({tid})", limit=10, domain="music")
+        if not (search.get("items") or search.get("memories")):
+            search = bank.search(str(tid), limit=10, domain="music")
         items = search.get("items") or search.get("memories") or []
         superseded = []
+        search_error = search.get("error")
         for mem in items:
             if not isinstance(mem, dict):
                 continue
             meta = mem.get("metadata") or {}
-            if str(meta.get("target_id") or "") != tid:
+            content = str(mem.get("content") or "")
+            meta_tid = str(meta.get("target_id") or "")
+            if meta_tid and meta_tid != tid:
                 continue
-            if str(meta.get("action") or "") not in ("saved", "saves", ""):
-                # still allow if content looks like save observation
-                if "收藏" not in str(mem.get("content") or ""):
+            if not meta_tid and tid not in content:
+                continue
+            action = str(meta.get("action") or "")
+            if action and action not in ("saved", "saves"):
+                if "收藏" not in content:
                     continue
+            elif not action and "收藏" not in content and "music:observed" not in content:
+                continue
             mid = str(mem.get("id") or "")
             if not mid:
                 continue
@@ -126,6 +137,8 @@ def apply_revokes(
                 "target_id": tid,
                 "observe": obs,
                 "superseded": superseded,
+                "search_error": search_error,
+                "search_hits": len(items),
             }
         )
     return {"ok": True, "dry_run": False, "applied": results, "count": len(results)}

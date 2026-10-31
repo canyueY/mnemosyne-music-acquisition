@@ -11,9 +11,10 @@
 | | |
 | --- | --- |
 | 包名 | `mnemosyne-music-acquisition`（Python：`music_acquisition`） |
-| 版本 | **0.4.1** |
+| 版本 | **0.4.2** |
 | 组件 ID | `mnemosyne.music-acquisition` |
 | **音乐源** | **仅网易云（Netease）** |
+| 成熟度 | **Beta**：网易云采集 + Mnemosyne HTTP 证据上行可用；**不是** GA 级 3.0 完整适配；DSH 仅为占位壳 |
 | 许可 | [AGPL-3.0-or-later](LICENSE) |
 | 原则 | 安装 ≠ 授权 ≠ 同步 · **永不静默写入 likes / confirmed** |
 
@@ -106,6 +107,17 @@ POST /api/music/v1/playlist/roundtrip
 1. 本组件 **禁止** 直接打开 Node 的 `memory.db`。
 2. **安装 Domain Pack** 只注册本体（Track / Artist / …）；**不同步**用户红心进长期 likes。
 3. 检索：无关 query 排除 `metadata.domain=music`；音乐意图或 `domain=music` 才召回（Node 侧闸门）。
+
+**与当前 Mnemosyne 3.x 的契约（0.4.2）**
+
+| 路径 | 状态 |
+| --- | --- |
+| Observation / Memory / Relation / Feedback / Health | 可用 |
+| 搜索 | **`POST /api/v1/memories/search`**（已修复错误的 `/api/v1/search`）+ `domain` |
+| Domain Pack | `POST /api/v1/domains/register`（**inline pack**）；缺路由则诚实失败，bootstrap 不计成功 |
+| DSH 插件 | **占位**（`hosts/dsh-mnemosyne-music` README + stub Host），以 Python/REST 为准 |
+
+对外表述：支持网易云采集、快照、证据上行与可选播放桥；默认对接 Mnemosyne HTTP；Search / Domain Pack 客户端已对齐现行 Node，但 Cookie 加密、调度、Claim、DSH 发布仍未 GA。
 
 契约全文：[`docs/MUSIC_DOMAIN_INTEGRATION_CONTRACT.md`](docs/MUSIC_DOMAIN_INTEGRATION_CONTRACT.md)。
 

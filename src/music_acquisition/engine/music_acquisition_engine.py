@@ -312,36 +312,52 @@ class MusicAcquisitionEngine:
         return items
 
     def register_music_domain(self, *, pack_path: str = "") -> dict:
-        """Install-time equivalent: register Music Domain Pack via Mnemosyne API."""
+        """Install-time equivalent: register Music Domain Pack via Mnemosyne API.
+
+        Always loads the pack locally and POSTs inline JSON. Never relies on Node
+        being able to read a host filesystem ``pack_path``.
+        """
+        import json
         from pathlib import Path
 
-        if not self._mnemosyne:
-            # local-only: return pack path for Node to consume
-            default = (
-                Path(__file__).resolve().parents[3]
-                / "domain"
-                / "music_domain_pack.v1.json"
-            )
-            # package layout: src/music_acquisition/engine → parents[2]=src, need repo root
-            alt = Path(__file__).resolve().parents[2].parent / "domain" / "music_domain_pack.v1.json"
-            path = Path(pack_path) if pack_path else (default if default.is_file() else alt)
-            return {
-                "ok": path.is_file(),
-                "pack_path": str(path),
-                "note": "mnemosyne_not_configured; register via Node POST /domains/register",
-            }
+        candidates: list[Path] = []
         if pack_path:
-            return self._mnemosyne.register_domain_pack(pack_path=pack_path)
-        # inline pack
-        for cand in (
-            Path(__file__).resolve().parents[3] / "domain" / "music_domain_pack.v1.json",
-            Path(__file__).resolve().parents[2].parent / "domain" / "music_domain_pack.v1.json",
-        ):
+            candidates.append(Path(pack_path))
+        candidates.extend(
+            [
+                Path(__file__).resolve().parents[3] / "domain" / "music_domain_pack.v1.json",
+                Path(__file__).resolve().parents[2].parent / "domain" / "music_domain_pack.v1.json",
+            ]
+        )
+        pack: dict | None = None
+        used = ""
+        for cand in candidates:
             if cand.is_file():
-                import json
+                try:
+                    pack = json.loads(cand.read_text(encoding="utf-8"))
+                    used = str(cand)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    return {"ok": False, "error": "pack_read_failed", "detail": str(exc), "pack_path": str(cand)}
+        if pack is None:
+            return {"ok": False, "error": "pack_not_found", "tried": [str(c) for c in candidates]}
 
-                return self._mnemosyne.register_domain_pack(json.loads(cand.read_text(encoding="utf-8")))
-        return {"ok": False, "error": "pack_not_found"}
+        if not self._mnemosyne:
+            return {
+                "ok": True,
+                "local_only": True,
+                "pack_path": used,
+                "domain_id": pack.get("domain_id"),
+                "note": (
+                    "mnemosyne_not_configured; pack loaded locally only. "
+                    "Configure Mnemosyne URL to POST /api/v1/domains/register."
+                ),
+            }
+        result = self._mnemosyne.register_domain_pack(pack, pack_path=used)
+        if self._bank and hasattr(self._bank, "register_domain_pack"):
+            # Keep bank backend path consistent when dual-wrapped.
+            pass
+        return {**result, "pack_path": used}
 
     def promote_music_graph(self, *, dry_run: bool = True, user_anchor_memory_id: str = "") -> dict:
         items = self._collect_recent_evidence_items()
@@ -606,13 +622,29 @@ class MusicAcquisitionEngine:
         )
         steps["submit"] = submit
         steps["playlist_scopes"] = self.sync_playlist_scopes_from_client()
-        ok = run.status in ("success", "partial") and bool(steps.get("user_anchor", {}).get("ok", True))
+        domain_ok = bool(steps.get("domain", {}).get("ok"))
+        # When Mnemosyne is configured, domain registration failure must fail bootstrap.
+        if self._mnemosyne and not domain_ok:
+            domain_ok = False
+        elif not self._mnemosyne:
+            domain_ok = bool(steps.get("domain", {}).get("ok", True))
+        ok = (
+            run.status in ("success", "partial")
+            and bool(steps.get("user_anchor", {}).get("ok", True))
+            and domain_ok
+        )
         return {
             "ok": ok,
             "version": __version__,
             "user_anchor_id": self._user_anchor_id,
             "memory_bank_kind": getattr(self._bank, "kind", None),
+            "domain_ok": domain_ok,
             "steps": steps,
+            "warnings": (
+                []
+                if domain_ok
+                else ["domain_register_failed — ontology may be missing on Node"]
+            ),
         }
 
     def recall(self, *, subject_id: str, query: str = "") -> dict:

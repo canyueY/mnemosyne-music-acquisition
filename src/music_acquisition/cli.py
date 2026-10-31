@@ -137,6 +137,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 async def _adoctor(args: argparse.Namespace) -> int:
     from music_acquisition.bank_paths import bank_layout_status
     from music_acquisition.engine import MusicAcquisitionEngine
+    from music_acquisition.memory.mnemosyne_client import MnemosyneHttpClient
     from music_acquisition.playlist_scope_store import get_store
 
     host = _host(args)
@@ -150,6 +151,11 @@ async def _adoctor(args: argparse.Namespace) -> int:
     )
     status = await engine.initialize()
     scopes = get_store(Path(host.local_storage.root()) / "playlist_scopes").snapshot()
+    contract = None
+    if args.mnemosyne_url:
+        contract = MnemosyneHttpClient(
+            args.mnemosyne_url, args.mnemosyne_token
+        ).contract_probe()
     print(
         json.dumps(
             {
@@ -157,13 +163,22 @@ async def _adoctor(args: argparse.Namespace) -> int:
                 "memory_bank": bank,
                 "playlist_scopes": scopes,
                 "mnemosyne_url": args.mnemosyne_url or None,
+                "mnemosyne_contract": contract,
+                "maturity": {
+                    "netease_acquisition": "beta",
+                    "mnemosyne_http": "beta",
+                    "dsh_plugin": "stub",
+                    "ga": False,
+                    "note": "Observation/Memory/Relation usable; fix search path + domain register required for GA claim",
+                },
             },
             ensure_ascii=False,
             indent=2,
         )
     )
     await engine.shutdown()
-    return 0 if status.ok else 1
+    contract_ok = True if contract is None else bool(contract.get("ok") and contract.get("search", {}).get("ok"))
+    return 0 if status.ok and contract_ok else 1
 
 
 def _cmd_demo(args: argparse.Namespace) -> int:

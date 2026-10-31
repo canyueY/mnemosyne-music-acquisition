@@ -1,7 +1,7 @@
 {
   "component_id": "mnemosyne.music-acquisition",
   "name": "Mnemosyne Music Acquisition",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "provider",
   "provider": "official",
   "interfaces": {

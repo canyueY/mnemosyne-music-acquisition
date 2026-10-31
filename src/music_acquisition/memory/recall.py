@@ -63,10 +63,15 @@ class MusicRecallService:
     def recall_with_mnemosyne(self, query: str) -> dict[str, Any]:
         if not self._mnemosyne:
             return {"ok": False, "error": "mnemosyne_client_not_configured"}
-        hit = self._mnemosyne.search(query, limit=8)
+        hit = self._mnemosyne.search(query, limit=8, domain="music")
+        items = hit.get("items") or hit.get("memories") or []
+        ok = bool(hit.get("ok")) and not hit.get("error")
         return {
-            "ok": bool(hit.get("ok", True) if "ok" in hit else "items" in hit or "memories" in hit),
+            "ok": ok,
             "backend": "mnemosyne",
+            "path": hit.get("path"),
+            "items": items,
+            "count": len(items) if isinstance(items, list) else 0,
             "raw": hit,
-            "note": "LT recall authority is Mnemosyne; acquisition cache is secondary",
+            "note": "LT recall authority is Mnemosyne; acquisition cache is secondary; claims≠Claim objects",
         }

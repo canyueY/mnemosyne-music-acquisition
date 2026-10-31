@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mnemosyne-music-acquisition"
-version = "0.4.1"
+version = "0.4.2"
 description = "Mnemosyne Music Acquisition — Independent music data acquisition engine (Netease-ready, host-agnostic)"
 readme = "README.md"
 requires-python = ">=3.10"

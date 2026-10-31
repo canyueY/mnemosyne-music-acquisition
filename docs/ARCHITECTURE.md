@@ -1,11 +1,15 @@
 # Mnemosyne Music Acquisition — Architecture
 
-**文档版本：** 1.0  
-**设计状态：** Architecture Proposal + Phase 1 Skeleton Implemented  
+**文档版本：** 1.1  
+**设计状态：** **Beta 已实现**（Python 包 + REST + NetEase 采集；非 GA）  
+**包版本：** 0.4.2  
 **包路径：** mnemosyne-music-acquisition/（独立组件模块）  
-**适用：** Mnemosyne / DSH / 未来 dsh-mnemosyne-music  
-**部署：** Dual-Mode（DSH Host + Standalone Mnemosyne Node）  
-**定位：** Independent Music Acquisition Infrastructure  
+**适用：** Mnemosyne HTTP（默认）/ 可选 HostRuntime；DSH 仅为占位壳  
+**部署：** Standalone / Filesystem Host 为主；DSH Dual-Mode 接口预留未发布  
+**定位：** Independent Music Acquisition Infrastructure（网易云限定）  
+
+> 成熟度：Observation / Memory / Relation 路径可用；Search 已对齐 `/api/v1/memories/search`；Domain Pack 依赖 Node `POST /api/v1/domains/register`；DSH npm 插件未发布。不要把本文当成「Phase 1 骨架」——实现已超过骨架，但尚未宣称 GA。  
+
 
 **原则：** Zero Extra User Tools · Host Agnostic · Authorization First · Local First · Evidence Driven
 
