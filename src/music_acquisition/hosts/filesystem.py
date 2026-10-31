@@ -8,22 +8,39 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from music_acquisition.hosts.scheduler import ThreadingScheduler
+from music_acquisition.security.credential_crypto import CredentialCrypto, is_encrypted_blob
+
 
 class FileCredentialStore:
+    """Encrypted-at-rest credential store (Fernet ENC1: + keyring/local master)."""
+
     def __init__(self, root: Path) -> None:
         self._root = root / "credentials"
         self._root.mkdir(parents=True, exist_ok=True)
+        self._crypto = CredentialCrypto(self._root)
 
     def _path(self, key: str) -> Path:
         safe = key.replace("/", "_").replace(":", "_")
         return self._root / f"{safe}.bin"
 
     async def save(self, key: str, value: bytes) -> None:
-        self._path(key).write_bytes(value)
+        sealed = self._crypto.seal(value)
+        self._path(key).write_bytes(sealed)
 
     async def load(self, key: str) -> bytes | None:
         p = self._path(key)
-        return p.read_bytes() if p.is_file() else None
+        if not p.is_file():
+            return None
+        raw = p.read_bytes()
+        plain = self._crypto.open(raw)
+        # Auto-upgrade legacy plaintext on read
+        if not is_encrypted_blob(raw):
+            try:
+                p.write_bytes(self._crypto.seal(plain))
+            except Exception:
+                pass
+        return plain
 
     async def delete(self, key: str) -> None:
         p = self._path(key)
@@ -32,6 +49,9 @@ class FileCredentialStore:
 
     async def exists(self, key: str) -> bool:
         return self._path(key).is_file()
+
+    def crypto_status(self) -> dict[str, Any]:
+        return self._crypto.status()
 
 
 class FileLocalStorage:
@@ -60,14 +80,6 @@ class FileLocalStorage:
     def read_json(self, rel: str) -> Any | None:
         raw = self.read_bytes(rel)
         return json.loads(raw.decode("utf-8")) if raw else None
-
-
-class _Scheduler:
-    def schedule(self, job_id: str, delay_sec: float, callback: Any) -> str:
-        return job_id
-
-    def cancel(self, handle: str) -> None:
-        return None
 
 
 class _Events:
@@ -154,7 +166,7 @@ class FilesystemHostRuntime:
         base = Path(root)
         base.mkdir(parents=True, exist_ok=True)
         self.credential_store = FileCredentialStore(base)
-        self.task_scheduler = _Scheduler()
+        self.task_scheduler = ThreadingScheduler()
         self.event_publisher = _Events()
         self.local_storage = FileLocalStorage(base)
         self.http_transport = _Http()
@@ -162,3 +174,8 @@ class FilesystemHostRuntime:
         self.logger = _Logger()
         self.clock = _Clock(timezone)
         self.host_name = "mnemosyne_node_fs"
+
+    def shutdown(self) -> None:
+        shutdown = getattr(self.task_scheduler, "shutdown", None)
+        if callable(shutdown):
+            shutdown()

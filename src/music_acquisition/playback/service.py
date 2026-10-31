@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -19,13 +20,18 @@ class MusicPlaybackService:
         *,
         enable_murasaame_bridge: bool = True,
         scope_store: "PlaylistScopeStore | None" = None,
+        verify_timeout_sec: float = 4.0,
+        verify_poll_sec: float = 0.4,
     ) -> None:
         self._bridge = enable_murasaame_bridge
         self._scope_store = scope_store
         self._last: dict[str, Any] = {}
+        self._verify_timeout_sec = float(verify_timeout_sec)
+        self._verify_poll_sec = float(verify_poll_sec)
 
     def capabilities(self) -> dict[str, bool]:
         ok = False
+        verify = False
         if self._bridge:
             try:
                 from Murasame import netease_music as NM  # type: ignore
@@ -33,6 +39,12 @@ class MusicPlaybackService:
                 ok = bool(getattr(NM, "is_enabled", lambda: True)())
             except Exception:
                 ok = False
+            try:
+                from Murasame import netease_cdp as CDP  # type: ignore
+
+                verify = hasattr(CDP, "cdp_is_playing") and hasattr(CDP, "cdp_current_track_id")
+            except Exception:
+                verify = False
         return {
             "playbackControl": ok,
             "playSong": ok,
@@ -40,10 +52,51 @@ class MusicPlaybackService:
             "playDaily": ok,
             "playNextInScope": ok,
             "roundtripLookup": self._scope_store is not None or ok,
-            "verifyPlayback": False,
+            "verifyPlayback": bool(ok and verify),
         }
 
-    def play_song(self, track_id: str) -> dict[str, Any]:
+    def _verify_playing(self, expected_track_id: str | None = None) -> dict[str, Any]:
+        """Poll CDP until playing (and optional track id match) or timeout."""
+        if not self.capabilities().get("verifyPlayback"):
+            return {"ok": False, "verified": False, "error": "VERIFY_UNSUPPORTED"}
+        try:
+            from Murasame.netease_cdp import (  # type: ignore
+                cdp_current_track_id,
+                cdp_get_playing_track_info,
+                cdp_is_playing,
+            )
+            from Murasame.netease_music import _try_cdp_ready  # type: ignore
+            from Murasame.utils import get_config  # type: ignore
+
+            ready, port = _try_cdp_ready(get_config())
+            if not ready:
+                return {"ok": False, "verified": False, "error": "CDP_NOT_READY"}
+
+            deadline = time.monotonic() + self._verify_timeout_sec
+            last: dict[str, Any] = {}
+            expect = str(expected_track_id or "").replace("netease:", "").strip()
+            while time.monotonic() < deadline:
+                playing = bool(cdp_is_playing(port=port))
+                cur = str(cdp_current_track_id(port=port) or "")
+                info: dict[str, Any] = {}
+                try:
+                    info = cdp_get_playing_track_info(port=port) or {}
+                except Exception:
+                    info = {}
+                last = {"playing": playing, "track_id": cur, "info": info, "port": port}
+                if playing and (not expect or cur == expect or expect in cur):
+                    return {"ok": True, "verified": True, **last}
+                time.sleep(self._verify_poll_sec)
+            return {
+                "ok": False,
+                "verified": False,
+                "error": "VERIFY_TIMEOUT",
+                **last,
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "verified": False, "error": "VERIFY_FAILED", "detail": str(exc)}
+
+    def play_song(self, track_id: str, *, verify: bool = True) -> dict[str, Any]:
         if not self.capabilities().get("playSong"):
             return {"ok": False, "error": "PLAYBACK_UNSUPPORTED"}
         try:
@@ -51,8 +104,15 @@ class MusicPlaybackService:
 
             sid = int(str(track_id).replace("netease:", ""))
             result = NM.launch_cloudmusic_song(sid)
-            self._last = {"target": sid, "result": result}
-            return {"ok": True, "result": result}
+            out: dict[str, Any] = {"ok": True, "result": result, "track_id": str(sid)}
+            if verify and self.capabilities().get("verifyPlayback"):
+                v = self._verify_playing(str(sid))
+                out["verify"] = v
+                out["ok"] = bool(v.get("verified"))
+                if not out["ok"]:
+                    out["error"] = v.get("error") or "PLAY_NOT_VERIFIED"
+            self._last = out
+            return out
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": "PLAY_FAILED", "detail": str(exc)}
 
@@ -74,8 +134,14 @@ class MusicPlaybackService:
             if track_id is not None:
                 return self.play_song(track_id)
             result = NM.play_playlist_id(pid)
-            self._last = {"playlist": pid, "result": result}
-            return {"ok": True, "result": result}
+            out: dict[str, Any] = {"ok": True, "playlist": pid, "result": result}
+            if self.capabilities().get("verifyPlayback"):
+                v = self._verify_playing(None)
+                out["verify"] = v
+                # playlist open may not immediately report track — soft verify
+                out["ok"] = bool(result) if not v.get("verified") else True
+            self._last = out
+            return out
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": "PLAY_FAILED", "detail": str(exc)}
 
@@ -114,14 +180,18 @@ class MusicPlaybackService:
 
             action = "next" if int(delta) >= 0 else "prev"
             result = NM.media_control(action, cfg=get_config())
-            # 刷一份边界进 Bank，便于跨进程往返
             if self._scope_store is not None:
                 try:
                     self._scope_store.ingest_from_murasame_registry()
                 except Exception:
                     pass
-            self._last = {"action": action, "result": result}
-            return {"ok": bool(result.get("ok")), "result": result}
+            out: dict[str, Any] = {"ok": bool(result.get("ok")), "result": result, "action": action}
+            if out["ok"] and self.capabilities().get("verifyPlayback"):
+                v = self._verify_playing(None)
+                out["verify"] = v
+                out["ok"] = bool(v.get("verified") or result.get("ok"))
+            self._last = out
+            return out
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": "CONTROL_FAILED", "detail": str(exc)}
 
@@ -175,9 +245,13 @@ class MusicPlaybackService:
         return hit
 
     def get_playback_status(self) -> dict[str, Any]:
+        live: dict[str, Any] = {}
+        if self.capabilities().get("verifyPlayback"):
+            live = self._verify_playing(None)
         return {
             "ok": True,
             "last": self._last,
+            "live": live,
             "capabilities": self.capabilities(),
             "scopes": self._scope_store.snapshot() if self._scope_store else None,
         }

@@ -105,6 +105,16 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("probe-artists", help="Probe weapi artist/sublist with saved cookie")
     p.set_defaults(func=_cmd_probe_artists)
 
+    p = sub.add_parser("enable-auto-sync", help="Schedule recurring sync+submit via host scheduler")
+    p.add_argument("--every-sec", type=float, default=86400.0)
+    p.add_argument("--initial-delay-sec", type=float, default=5.0)
+    p.add_argument("--no-submit", action="store_true")
+    p.add_argument("--block", action="store_true", help="keep process alive (Ctrl+C to stop)")
+    p.set_defaults(func=_cmd_enable_auto_sync)
+
+    p = sub.add_parser("disable-auto-sync", help="Cancel recurring auto-sync handle")
+    p.set_defaults(func=_cmd_disable_auto_sync)
+
     args = parser.parse_args(argv)
     return int(args.func(args))
 
@@ -169,8 +179,12 @@ async def _adoctor(args: argparse.Namespace) -> int:
                     "mnemosyne_http": "beta",
                     "dsh_plugin": "stub",
                     "ga": False,
-                    "note": "Observation/Memory/Relation usable; fix search path + domain register required for GA claim",
+                    "note": "0.5.0 Beta+: encrypted credentials, scheduler, per-item outbox, ClaimBridge, verifyPlayback",
                 },
+                "credentials_crypto": getattr(
+                    getattr(host, "credential_store", None), "crypto_status", lambda: None
+                )(),
+                "scheduler": engine.scheduler_snapshot(),
             },
             ensure_ascii=False,
             indent=2,
@@ -524,6 +538,63 @@ async def _aprobe_artists(args: argparse.Namespace) -> int:
     _print_json(out)
     await engine.shutdown()
     return 0 if out["ok"] else 1
+
+
+def _cmd_enable_auto_sync(args: argparse.Namespace) -> int:
+    return asyncio.run(_aenable_auto_sync(args))
+
+
+async def _aenable_auto_sync(args: argparse.Namespace) -> int:
+    import time
+
+    from music_acquisition.engine import MusicAcquisitionEngine
+
+    engine = MusicAcquisitionEngine(
+        _host(args),
+        use_real_netease=True,
+        mnemosyne_base_url=args.mnemosyne_url,
+        mnemosyne_token=args.mnemosyne_token,
+    )
+    await engine.initialize()
+    result = engine.enable_auto_sync(
+        interval_sec=float(args.every_sec),
+        initial_delay_sec=float(args.initial_delay_sec),
+        submit=not bool(args.no_submit),
+    )
+    result["scheduler"] = engine.scheduler_snapshot()
+    _print_json(result)
+    if args.block:
+        try:
+            while True:
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            engine.disable_auto_sync()
+            await engine.shutdown()
+    else:
+        # Keep process briefly so first timer can register; caller should use --block for daemon.
+        await engine.shutdown()
+    return 0 if result.get("ok") else 1
+
+
+def _cmd_disable_auto_sync(args: argparse.Namespace) -> int:
+    return asyncio.run(_adisable_auto_sync(args))
+
+
+async def _adisable_auto_sync(args: argparse.Namespace) -> int:
+    from music_acquisition.engine import MusicAcquisitionEngine
+
+    engine = MusicAcquisitionEngine(
+        _host(args),
+        mnemosyne_base_url=args.mnemosyne_url,
+        mnemosyne_token=args.mnemosyne_token,
+    )
+    await engine.initialize()
+    result = engine.disable_auto_sync()
+    _print_json(result)
+    await engine.shutdown()
+    return 0 if result.get("ok") else 1
 
 
 if __name__ == "__main__":

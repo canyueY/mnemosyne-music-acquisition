@@ -11,10 +11,10 @@
 | | |
 | --- | --- |
 | 包名 | `mnemosyne-music-acquisition`（Python：`music_acquisition`） |
-| 版本 | **0.4.2** |
+| 版本 | **0.5.0** |
 | 组件 ID | `mnemosyne.music-acquisition` |
 | **音乐源** | **仅网易云（Netease）** |
-| 成熟度 | **Beta**：网易云采集 + Mnemosyne HTTP 证据上行可用；**不是** GA 级 3.0 完整适配；DSH 仅为占位壳 |
+| 成熟度 | **Beta+**：P0/P1 闭合（加密 Cookie、调度、Outbox 条目级、verifyPlayback、Claim 映射、DSH Host 桥）；仍非多源 GA |
 | 许可 | [AGPL-3.0-or-later](LICENSE) |
 | 原则 | 安装 ≠ 授权 ≠ 同步 · **永不静默写入 likes / confirmed** |
 
@@ -24,7 +24,9 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 授权（网易云） | **QR 扫码** 或 **config-bind**（红心歌单 ID）；Cookie 落 Memory Bank `credentials/`（不进日志） |
+| 授权（网易云） | **QR 扫码** 或 **config-bind**；Cookie **Fernet 加密**落盘（可选 OS keyring；不进日志） |
+| 自动同步 | `enable-auto-sync`（ThreadingScheduler）；也可用外部 cron |
+| Claim | confirm/unconfirm → Claim 载荷；Node 无 `/claims` 时回退 Memory(`data_kind=claim`) |
 | 采集（网易云） | 红心 / 歌单 / 日推 / 播放历史 / 收藏歌手 → 本地 snapshot |
 | 点播与控制（网易云，可选桥） | 点歌、红心歌单、日推、歌单内下一曲/上一曲、序号往返；见下节 |
 | 对账 | 取消收藏 → diff → revoke；**不自动**撕 confirmed likes |
@@ -115,9 +117,9 @@ POST /api/music/v1/playlist/roundtrip
 | Observation / Memory / Relation / Feedback / Health | 可用 |
 | 搜索 | **`POST /api/v1/memories/search`**（已修复错误的 `/api/v1/search`）+ `domain` |
 | Domain Pack | `POST /api/v1/domains/register`（**inline pack**）；缺路由则诚实失败，bootstrap 不计成功 |
-| DSH 插件 | **占位**（`hosts/dsh-mnemosyne-music` README + stub Host），以 Python/REST 为准 |
+| DSH | **Host 桥已可运行**（`DshHostRuntime` + npm spawn CLI）；不是完整 Cordis 市场插件 |
 
-对外表述：支持网易云采集、快照、证据上行与可选播放桥；默认对接 Mnemosyne HTTP；Search / Domain Pack 客户端已对齐现行 Node，但 Cookie 加密、调度、Claim、DSH 发布仍未 GA。
+对外表述：支持网易云采集、加密凭证、自动调度、条目级 Outbox、证据上行、Claim 映射与可选 CDP 校验播放桥；默认对接 Mnemosyne HTTP。
 
 契约全文：[`docs/MUSIC_DOMAIN_INTEGRATION_CONTRACT.md`](docs/MUSIC_DOMAIN_INTEGRATION_CONTRACT.md)。
 

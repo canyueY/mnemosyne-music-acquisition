@@ -1,8 +1,8 @@
 # Mnemosyne Music Acquisition — Architecture
 
 **文档版本：** 1.1  
-**设计状态：** **Beta 已实现**（Python 包 + REST + NetEase 采集；非 GA）  
-**包版本：** 0.4.2  
+**设计状态：** **Beta+ 已实现**（加密凭证 / 调度 / 条目 Outbox / Claim / verifyPlayback；非多源 GA）  
+**包版本：** 0.5.0  
 **包路径：** mnemosyne-music-acquisition/（独立组件模块）  
 **适用：** Mnemosyne HTTP（默认）/ 可选 HostRuntime；DSH 仅为占位壳  
 **部署：** Standalone / Filesystem Host 为主；DSH Dual-Mode 接口预留未发布  

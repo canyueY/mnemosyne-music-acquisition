@@ -24,6 +24,7 @@ from music_acquisition.memory.bank_backend import MemoryBankBackend, open_memory
 from music_acquisition.memory.graph_builder import MusicGraphBuilder
 from music_acquisition.memory.mnemosyne_client import MnemosyneHttpClient
 from music_acquisition.memory.outbox import EvidenceOutbox
+from music_acquisition.memory.claims import ClaimBridge
 from music_acquisition.memory.preference_confirm import (
     confirm_preference,
     reject_preference,
@@ -101,8 +102,10 @@ class MusicAcquisitionEngine:
         scopes_root = Path(host.local_storage.root()) / "playlist_scopes"
         self._scope_store = get_store(scopes_root)
         self._playback = MusicPlaybackService(scope_store=self._scope_store)
+        self._claims = ClaimBridge(client=self._mnemosyne, bank=self._bank)
         self._user_anchor_id = ""
         self._initialized = False
+        self._auto_sync_handle = ""
 
     @property
     def source(self) -> MusicSourceAdapter:
@@ -434,6 +437,7 @@ class MusicAcquisitionEngine:
             memory_id=memory_id or None,
             note=note,
             dry_run=dry_run,
+            claim_bridge=self._claims,
         )
 
     def reject_preference_signal(
@@ -480,6 +484,7 @@ class MusicAcquisitionEngine:
             memory_id=memory_id,
             note=note,
             dry_run=dry_run,
+            claim_bridge=self._claims,
         )
 
     def monitor_snapshot(self) -> dict:
@@ -698,7 +703,105 @@ class MusicAcquisitionEngine:
     def hydrate_playlist_scopes_to_client(self) -> dict:
         return self._scope_store.hydrate_murasame_registry()
 
+    def enable_auto_sync(
+        self,
+        *,
+        interval_sec: float = 86400.0,
+        collectors: list[str] | None = None,
+        submit: bool = True,
+        promote_graph: bool = False,
+        initial_delay_sec: float = 5.0,
+    ) -> dict:
+        """Schedule recurring sync+submit via HostRuntime.task_scheduler.
+
+        Requires a real scheduler (FilesystemHost ThreadingScheduler). Returns
+        handle; cancel with ``disable_auto_sync``.
+        """
+        self._ensure_init()
+        sched = self._host.task_scheduler
+        every = getattr(sched, "schedule_every", None)
+        cols = collectors or [
+            "liked_songs",
+            "playlists",
+            "daily_songs",
+            "playback_history",
+            "favorite_artists",
+        ]
+
+        def _job() -> None:
+            import asyncio
+
+            from music_acquisition.domain.models import SyncRequest
+
+            async def _run() -> None:
+                try:
+                    await self.sync_now(
+                        SyncRequest(owner_user_id=self._owner_user_id, collectors=cols)
+                    )
+                    if submit:
+                        self.submit_evidence_outbox(
+                            promote_graph=promote_graph,
+                            publish_preference_signals=False,
+                            dry_run_graph=True,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    self._host.logger.warning("auto_sync_failed", error=str(exc))
+
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(_run())
+                else:
+                    loop.run_until_complete(_run())
+            except RuntimeError:
+                asyncio.run(_run())
+
+        if callable(every):
+            handle = every(
+                "music_auto_sync",
+                float(interval_sec),
+                _job,
+                initial_delay_sec=float(initial_delay_sec),
+            )
+        else:
+            handle = sched.schedule("music_auto_sync", float(initial_delay_sec), _job)
+        self._auto_sync_handle = str(handle)
+        meta = {
+            "handle": self._auto_sync_handle,
+            "interval_sec": interval_sec,
+            "collectors": cols,
+            "submit": submit,
+            "scheduler": type(sched).__name__,
+            "enabled_at": self._host.clock.now_iso(),
+        }
+        self._host.local_storage.write_json("config/auto_sync.json", meta)
+        self._host.logger.info("auto_sync_enabled", **meta)
+        return {"ok": True, **meta}
+
+    def disable_auto_sync(self) -> dict:
+        handle = self._auto_sync_handle or "music_auto_sync"
+        try:
+            self._host.task_scheduler.cancel(handle)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        self._auto_sync_handle = ""
+        self._host.local_storage.write_json(
+            "config/auto_sync.json", {"enabled": False, "disabled_at": self._host.clock.now_iso()}
+        )
+        return {"ok": True, "handle": handle}
+
+    def scheduler_snapshot(self) -> dict:
+        snap = getattr(self._host.task_scheduler, "snapshot", None)
+        return snap() if callable(snap) else {"ok": False, "error": "no_snapshot"}
+
     async def shutdown(self) -> None:
+        try:
+            self.disable_auto_sync()
+        except Exception:
+            pass
+        host_shutdown = getattr(self._host, "shutdown", None)
+        if callable(host_shutdown):
+            host_shutdown()
         self._initialized = False
         self._host.logger.info("engine_shutdown")
 

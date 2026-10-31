@@ -211,12 +211,17 @@ class MnemosyneHttpClient:
             "raw": last,
         }
 
+    def propose_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST /api/v1/claims when Node supports Claim objects (optional)."""
+        return self._request("POST", "/api/v1/claims", payload)
+
     def contract_probe(self) -> dict[str, Any]:
         """Lightweight capability probe for doctor / bootstrap diagnostics."""
         health = self.health()
         search = self.search("music", limit=1, domain="music")
         domain = self.get_domain("music")
         reg_probe = self._request("POST", self.DOMAIN_REGISTER_PATH, {"actor": "music_acquisition"})
+        claims_probe = self._request("POST", "/api/v1/claims", {"actor": "music_acquisition"})
         return {
             "ok": bool(health.get("ok", True) is not False and not health.get("error")),
             "health": health,
@@ -234,5 +239,10 @@ class MnemosyneHttpClient:
                 "exists": reg_probe.get("error") != "http_404",
                 "error": reg_probe.get("error"),
                 "note": "empty body may 422; 404 means route missing",
+            },
+            "claims_route": {
+                "exists": claims_probe.get("error") != "http_404",
+                "error": claims_probe.get("error"),
+                "note": "404 → ClaimBridge uses Memory fallback (data_kind=claim)",
             },
         }

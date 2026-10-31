@@ -28,15 +28,43 @@ class _MemCredentials:
 
 
 class _MemScheduler:
+    """Test scheduler: records jobs and can fire synchronously via ``fire``."""
+
     def __init__(self) -> None:
         self._jobs: dict[str, Callable[..., Any]] = {}
+        self._interval: dict[str, dict[str, Any]] = {}
 
     def schedule(self, job_id: str, delay_sec: float, callback: Any) -> str:
         self._jobs[job_id] = callback
         return job_id
 
+    def schedule_every(
+        self,
+        job_id: str,
+        interval_sec: float,
+        callback: Callable[..., Any],
+        *,
+        initial_delay_sec: float | None = None,
+    ) -> str:
+        self._interval[job_id] = {"interval_sec": interval_sec, "initial_delay_sec": initial_delay_sec}
+        self._jobs[job_id] = callback
+        return job_id
+
     def cancel(self, handle: str) -> None:
         self._jobs.pop(handle, None)
+        self._interval.pop(handle, None)
+
+    def fire(self, handle: str) -> None:
+        cb = self._jobs.get(handle)
+        if cb:
+            cb()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "pending_timers": list(self._jobs.keys()),
+            "interval_jobs": dict(self._interval),
+            "stopped": False,
+        }
 
 
 class _MemEvents:

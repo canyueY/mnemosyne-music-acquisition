@@ -23,6 +23,7 @@ def confirm_preference(
     memory_id: str | None = None,
     note: str = "",
     dry_run: bool = False,
+    claim_bridge: Any | None = None,
 ) -> dict[str, Any]:
     """Promote to confirmed preference + ``likes`` edge.
 
@@ -112,11 +113,24 @@ def confirm_preference(
             "producer": "music_acquisition.preference_confirm",
         }
     )
+    claim_resp = None
+    if claim_bridge is not None:
+        try:
+            claim_resp = claim_bridge.confirm_like_claim(
+                target_type=target_type,
+                target_id=tid,
+                title=title,
+                evidence_refs=evidence_refs,
+                note=note,
+            )
+        except Exception as exc:  # noqa: BLE001
+            claim_resp = {"ok": False, "error": str(exc)}
     audit = {
         "ok": True,
         "dry_run": False,
         "memory_id": mid,
         "memory": mem_resp,
+        "claim": claim_resp,
         "relation": rel_resp,
         "feedback": fb_resp,
         "target_id": tid,
@@ -200,6 +214,7 @@ def unconfirm_preference(
     memory_id: str = "",
     note: str = "",
     dry_run: bool = False,
+    claim_bridge: Any | None = None,
 ) -> dict[str, Any]:
     """Explicit user revoke of a prior confirmed like.
 
@@ -306,12 +321,24 @@ def unconfirm_preference(
             },
         }
     )
+    claim_resp = None
+    if claim_bridge is not None:
+        try:
+            claim_resp = claim_bridge.unconfirm_like_claim(
+                target_type=target_type,
+                target_id=tid,
+                title=title,
+                note=note,
+            )
+        except Exception as exc:  # noqa: BLE001
+            claim_resp = {"ok": False, "error": str(exc)}
     audit = {
         "ok": True,
         "dry_run": False,
         "memory_id": mid,
         "target_id": tid,
         "update": updated,
+        "claim": claim_resp,
         "relation_revoke": rev,
         "feedback": fb,
         "saves_untouched": True,

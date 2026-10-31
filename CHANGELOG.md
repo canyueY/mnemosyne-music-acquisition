@@ -1,6 +1,17 @@
 # Changelog
 
+## 0.5.0
+
+- **Cookie at-rest 加密**：Fernet `ENC1:` + OS keyring（可选 `[secure]`）或本地 `.master.key`；明文自动升级
+- **真实调度**：`ThreadingScheduler` + `enable-auto-sync` / `disable-auto-sync` CLI
+- **Outbox 条目级**：per-item status、文件锁、失败退避 `next_retry_at`；已成功条目不重复提交
+- **verifyPlayback**：点歌后 CDP 轮询 `cdp_is_playing` / `cdp_current_track_id`
+- **Claim 映射层**：`ClaimBridge`（原生 `/api/v1/claims` 或 Memory `data_kind=claim` 回退）；confirm/unconfirm 挂接
+- **DSH Host 桥**：可运行的 `DshHostRuntime` + npm `@canyuey/dsh-mnemosyne-music`（spawn Python，非完整 Cordis 市场插件）
+- Live 契约测试：`tests/test_live_mnemosyne_contract.py`（需 `MNEMOSYNE_BASE_URL` + token）
+
 ## 0.4.2
+
 
 - **P0 契约修复**：搜索改为 `POST /api/v1/memories/search`（不再打错误的 `/api/v1/search`）；客户端仍传 `domain` 并按 `metadata.domain` 二次过滤
 - Domain Pack：本地加载后 **inline** 提交；Node 缺路由时返回诚实错误 `domains_register_unsupported`；bootstrap 在 Mnemosyne 配置下要求 `domain_ok`

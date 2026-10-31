@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Submit evidence outbox → Mnemosyne observations (idempotent best-effort)."""
+"""Submit evidence outbox → Mnemosyne observations (per-item + backoff)."""
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from music_acquisition.contracts.host_runtime import HostRuntime
 from music_acquisition.memory.mnemosyne_client import MnemosyneHttpClient
 from music_acquisition.memory.outbox import EvidenceOutbox
+from music_acquisition.sync.retry import backoff_delay, should_retry
 
 
 def _observation_metadata(item: dict[str, Any], *, outbox_id: str) -> dict[str, Any]:
@@ -31,6 +33,23 @@ def _observation_metadata(item: dict[str, Any], *, outbox_id: str) -> dict[str, 
     }
 
 
+def _iso_after(seconds: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _due(batch: dict[str, Any]) -> bool:
+    nxt = str(batch.get("next_retry_at") or "").strip()
+    if not nxt:
+        return True
+    try:
+        # accept Z suffix
+        ts = nxt.replace("Z", "+00:00")
+        when = datetime.fromisoformat(ts)
+        return datetime.now(timezone.utc) >= when
+    except Exception:
+        return True
+
+
 class EvidenceSubmitter:
     def __init__(
         self,
@@ -42,7 +61,7 @@ class EvidenceSubmitter:
         self._client = client
         self._outbox = outbox
 
-    def submit_pending(self) -> dict[str, Any]:
+    def submit_pending(self, *, force: bool = False) -> dict[str, Any]:
         if not self._client:
             return {
                 "ok": False,
@@ -51,10 +70,24 @@ class EvidenceSubmitter:
             }
         results = []
         for batch in self._outbox.list_pending():
-            oid = batch["outbox_id"]
-            ok_all = True
-            for item in batch.get("items") or []:
-                # Never auto-create preference memory for recommendation_seen
+            if not force and not _due(batch):
+                results.append(
+                    {
+                        "outbox_id": batch.get("outbox_id"),
+                        "status": "deferred",
+                        "next_retry_at": batch.get("next_retry_at"),
+                    }
+                )
+                continue
+            oid = str(batch["outbox_id"])
+            items = [dict(x) for x in (batch.get("items") or [])]
+            submitted_now = 0
+            failed_now = 0
+            last_error = ""
+            for item in items:
+                st = str(item.get("item_status") or "pending")
+                if st == "submitted":
+                    continue
                 content = (
                     f"[music:{item.get('evidence_type')}|{item.get('data_kind')}|{item.get('action')}] "
                     f"target={item.get('target_type')}:{item.get('subject_id')} "
@@ -71,14 +104,53 @@ class EvidenceSubmitter:
                         "metadata": meta,
                     }
                 )
+                err = ""
                 if resp.get("ok") is False or resp.get("error"):
-                    ok_all = False
-                    break
-            if ok_all:
-                self._outbox.mark(oid, "submitted", submitted_at=self._host.clock.now_iso())
-                results.append({"outbox_id": oid, "status": "submitted"})
-            else:
-                attempts = int(batch.get("attempts") or 0) + 1
-                self._outbox.mark(oid, "pending", attempts=attempts, last_error="submit_failed")
-                results.append({"outbox_id": oid, "status": "retry"})
-        return {"ok": True, "results": results}
+                    err = str(resp.get("error") or resp.get("detail") or "submit_failed")
+                    item["item_attempts"] = int(item.get("item_attempts") or 0) + 1
+                    item["item_last_error"] = err
+                    last_error = err
+                    # permanent? mark failed; else keep pending for retry
+                    if should_retry(err):
+                        item["item_status"] = "pending"
+                    else:
+                        # treat unknown HTTP as retryable unless auth
+                        if str(err).startswith("http_5") or err in ("network", "submit_failed"):
+                            item["item_status"] = "pending"
+                        elif "auth" in err.lower() or "unauthorized" in err.lower():
+                            item["item_status"] = "failed"
+                        else:
+                            item["item_status"] = "pending"
+                    if item["item_status"] == "failed":
+                        failed_now += 1
+                    continue
+                item["item_status"] = "submitted"
+                item["item_submitted_at"] = self._host.clock.now_iso()
+                item["item_last_error"] = ""
+                submitted_now += 1
+
+            attempts = int(batch.get("attempts") or 0) + 1
+            still_pending = any(str(i.get("item_status")) == "pending" for i in items)
+            next_retry = ""
+            if still_pending:
+                delay = backoff_delay(attempts)
+                next_retry = _iso_after(delay)
+            updated = self._outbox.update_items(
+                oid,
+                items,
+                attempts=attempts,
+                last_error=last_error,
+                next_retry_at=next_retry,
+            )
+            results.append(
+                {
+                    "outbox_id": oid,
+                    "status": updated.get("status"),
+                    "submitted_now": submitted_now,
+                    "failed_now": failed_now,
+                    "item_stats": updated.get("item_stats"),
+                    "next_retry_at": next_retry or None,
+                }
+            )
+        ok = not any(r.get("status") == "failed" for r in results)
+        return {"ok": ok, "results": results, "per_item": True}
