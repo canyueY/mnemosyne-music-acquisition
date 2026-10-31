@@ -1,14 +1,19 @@
 # Mnemosyne Music Acquisition
 
-**网易云音乐数据采集与「音乐认知」接入层**（Host-agnostic）。
+**网易云音乐**数据采集、点播控制桥与「音乐认知」接入层。
 
-把听歌行为变成可治理的 Evidence / Observation / 候选记忆，再交给记忆库做长期认知——**默认对接 Mnemosyne**，也可用同一套接口接到其它记忆库。
+> **重要：目前只适配网易云 Music（Netease Cloud Music）。**  
+> 源适配器、授权、采集、点歌 / 红心 / 下一曲等播放桥，均按网易云桌面端 / Web API / weapi 实现。  
+> **不支持** QQ 音乐、Spotify、Apple Music 等其它平台（架构上可换 SourceAdapter，但仓库内尚未实现）。
+
+把听歌行为变成可治理的 Evidence / Observation / 候选记忆，再交给记忆库做长期认知——**默认对接 Mnemosyne**，也可用同一套接口接到其它记忆库。Host 运行时抽象（Host-agnostic）；**音乐源当前仅网易云**。
 
 | | |
 | --- | --- |
 | 包名 | `mnemosyne-music-acquisition`（Python：`music_acquisition`） |
 | 版本 | **0.4.1** |
 | 组件 ID | `mnemosyne.music-acquisition` |
+| **音乐源** | **仅网易云（Netease）** |
 | 许可 | [AGPL-3.0-or-later](LICENSE) |
 | 原则 | 安装 ≠ 授权 ≠ 同步 · **永不静默写入 likes / confirmed** |
 
@@ -18,17 +23,55 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 授权 | 网易云 **QR 扫码** 或 **config-bind**（红心歌单 ID）；Cookie 落 Memory Bank `credentials/`（不进日志） |
-| 采集 | 红心 / 歌单 / 日推 / 播放历史（weapi）/ 收藏歌手（weapi）→ 本地 snapshot |
+| 授权（网易云） | **QR 扫码** 或 **config-bind**（红心歌单 ID）；Cookie 落 Memory Bank `credentials/`（不进日志） |
+| 采集（网易云） | 红心 / 歌单 / 日推 / 播放历史 / 收藏歌手 → 本地 snapshot |
+| 点播与控制（网易云，可选桥） | 点歌、红心歌单、日推、歌单内下一曲/上一曲、序号往返；见下节 |
 | 对账 | 取消收藏 → diff → revoke；**不自动**撕 confirmed likes |
 | 音乐认知本体 | 安装/注册 `domain/music_domain_pack.v1.json` → Mnemosyne `CognitiveSchema`（仅本体，无用户偏好） |
 | 证据上行 | Outbox → Observation（`metadata.domain=music`） |
 | 图谱 | 可选 promote：`saves` / `listened_to` / `contains`（**禁止**自动 `likes`） |
 | 偏好 | PreferenceSignal = **inferred**；`confirm-like` / `unconfirm-like` 才动 confirmed / likes |
-| 桌宠 | 歌单边界 bank、口令「确认喜欢 / 取消确认喜欢 / 同步音乐记忆」 |
+| 桌宠口令 | 「播放红心 / 下一首 / 确认喜欢 / 同步音乐记忆」等（网易云客户端） |
 | 运维 | 最小 Monitor 页：`/monitor/` |
 
 诚实能力表与实机报告见 [`docs/MUSIC_SOURCE_CAPABILITY_MATRIX.md`](docs/MUSIC_SOURCE_CAPABILITY_MATRIX.md)、[`docs/LIVE_PROBE_QR_DAILY_HISTORY.md`](docs/LIVE_PROBE_QR_DAILY_HISTORY.md)。
+
+---
+
+## 点歌 · 红心 · 收藏 · 切歌（仅网易云）
+
+本包分两条线，**都只认网易云**：
+
+1. **采集线（本仓库核心）**：拉红心列表 / 歌单 / 日推 / 历史 / 关注歌手 → snapshot → 记忆库。  
+2. **播放控制线（可选）**：通过 `MusicPlaybackService` 桥接本机 **网易云桌面客户端**（常配合 Murasame / [netease-cdp](https://github.com/canyueY/netease-cdp)）。无桌宠 / 无客户端时返回 `PLAYBACK_UNSUPPORTED`，**采集仍可独立工作**。
+
+| 功能 | 含义（网易云） | 采集 | 播放控制 |
+| --- | --- | --- | --- |
+| **点歌** | 按曲目 ID / 歌名意图打开并播放 | — | `play_song` · `POST /playback/song` |
+| **红心歌单** | 「我喜欢的音乐」整单播放；config `favorite_playlist_id` | `liked_songs` 同步 | 桌宠 `play_favorites` / 桥接 playlist |
+| **收藏 / 红心行为** | 用户在客户端收藏过的曲目 → `action=saved`（observed，**不是**自动 likes） | ✅ sync + outbox | 确认喜欢另走 `confirm-like` |
+| **取消收藏** | 红心列表少了的歌 → revoke / supersede `saves` | ✅ diff | 不自动 `unconfirm-like` |
+| **下一曲 / 上一曲** | **当前源歌单**内邻曲（日推 / 红心 / 歌单），不是乱跳全局队列 | playlist_scopes 边界 | `play_next_in_scope` · `POST /playback/next` |
+| **按序号点播** | 「第 N 首」↔ track 往返查找 | scope bank | `roundtrip` / playback playlist+index |
+| **每日推荐** | 登录后个性化日推；未登录为公开池 | `daily_songs` | 桌宠 / CDP 日推播放 |
+| **收藏歌手** | 关注的艺人列表 | `favorite_artists`（需 Cookie） | — |
+| **暂停 / 继续 / 音量** | 客户端媒体键级控制 | — | 桌宠网易云意图（非本包采集 API） |
+
+**边界约定（避免「歌单第 N 首」点错）**
+
+- 「下一首」优先锚定 **源歌单**（`source:playlist:…` / `source:daily_recommend`），再才是 runtime 播放队列。  
+- 边界存在 Memory Bank：`music-acquisition/playlist_scopes/`。
+
+**HTTP 示例（需本机网易云 + 播放桥可用）**
+
+```http
+POST /api/music/v1/playback/song?track_id=1470902634
+POST /api/music/v1/playback/next?delta=1
+POST /api/music/v1/playback/next?delta=-1
+POST /api/music/v1/playlist/roundtrip
+```
+
+桌宠侧口语（同样 **只驱动网易云**）：「放红心歌单」「下一首」「播放某某歌」「确认喜欢这首歌」等。
 
 ---
 
@@ -217,7 +260,7 @@ py -3 -m music_acquisition.cli serve --port 8770
 
 - [dsh-mnemosyne](https://github.com/canyueY/dsh-mnemosyne) — Mnemosyne Node + DSH 适配  
 - [mnemosyne-memory-bank](https://github.com/canyueY/mnemosyne-memory-bank) — Memory Bank 说明  
-- [netease-cdp](https://github.com/canyueY/netease-cdp) — 桌面端 CDP 播放控制（互补，非本包采集权威）
+- [netease-cdp](https://github.com/canyueY/netease-cdp) — 网易云桌面 CDP 播放控制（与本包播放桥互补；**同样仅网易云**）
 
 ---
 
