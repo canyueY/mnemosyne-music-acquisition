@@ -281,3 +281,8 @@ py -3 -m music_acquisition.cli serve --port 8770
 ## License
 
 [AGPL-3.0-or-later](LICENSE) © canyueY
+
+
+---
+
+> **为什么还要开发 Mnemosyne？** [阅读全文 →](WHY_MNEMOSYNE.md)
