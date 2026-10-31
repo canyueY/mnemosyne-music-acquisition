@@ -9,9 +9,11 @@ from __future__ import annotations
 import base64
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
+from music_acquisition.source.http_error import SourceHttpError
 
 # Official web weapi constants (public; same as open NeteaseCloudMusicApi)
 _MODULUS = (
@@ -85,16 +87,20 @@ def weapi_post(
         "User-Agent": _WEAPI_UA,
         "Referer": "https://music.163.com/",
         "Content-Type": "application/x-www-form-urlencoded",
-        "Cookie": f"os=pc; appver=2.9.8; {cookie}".strip(),
     }
     req = urllib.request.Request(url, data=form, headers=headers, method="POST")
+    req.add_unredirected_header("Cookie", f"os=pc; appver=2.9.8; {cookie}".strip())
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             body = json.loads(raw) if raw else {}
             return body if isinstance(body, dict) else {"raw": body}
-    except Exception as exc:  # noqa: BLE001
-        return {"code": -1, "error": str(exc)}
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise PermissionError("LOGIN_REQUIRED") from exc
+        raise SourceHttpError(exc.code, exc.headers.get("Retry-After") if exc.headers else None) from exc
+    except (OSError, urllib.error.URLError) as exc:
+        raise ConnectionError("NETWORK_ERROR") from exc
 
 
 def fetch_play_record(

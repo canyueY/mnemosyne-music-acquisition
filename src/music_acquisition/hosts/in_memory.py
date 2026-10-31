@@ -8,6 +8,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from music_acquisition.util.runtime import atomic_write, under
 
 
 class _MemCredentials:
@@ -84,15 +85,15 @@ class _MemStorage:
         return str(self._root)
 
     def path(self, *parts: str) -> str:
-        p = self._root.joinpath(*parts)
+        p = under(self._root, *parts)
         p.parent.mkdir(parents=True, exist_ok=True)
         return str(p)
 
     def write_bytes(self, rel: str, data: bytes) -> None:
-        Path(self.path(rel)).write_bytes(data)
+        atomic_write(self.path(rel), data)
 
     def read_bytes(self, rel: str) -> bytes | None:
-        p = self._root / rel
+        p = under(self._root, rel)
         return p.read_bytes() if p.is_file() else None
 
     def write_json(self, rel: str, obj: Any) -> None:

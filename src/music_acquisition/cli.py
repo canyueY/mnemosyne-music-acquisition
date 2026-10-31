@@ -16,7 +16,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", default=os.environ.get("MNEMOSYNE_MUSIC_DATA", ""))
     parser.add_argument("--mnemosyne-url", default=os.environ.get("MNEMOSYNE_BASE_URL", ""))
     parser.add_argument("--mnemosyne-token", default=os.environ.get("DSH_MEMORY_TOKEN", ""))
+    parser.add_argument("--api-token", default=os.environ.get("MNEMOSYNE_MUSIC_API_TOKEN", ""))
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("mcp", help="Business-only MCP stdio gateway to a running service")
+    p.add_argument("--url", default="http://127.0.0.1:8770")
+    p.add_argument("--user", default="owner")
+    p.set_defaults(func=_cmd_mcp)
+
+    p = sub.add_parser("configure", help="Explicit owner scopes + Consent JSON (no credentials)")
+    p.add_argument("--file", required=True)
+    p.add_argument("--user", default="owner")
+    p.set_defaults(func=_cmd_configure)
 
     p = sub.add_parser("doctor")
     p.set_defaults(func=_cmd_doctor)
@@ -76,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--target-type", default="track")
     p.add_argument("--note", default="")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--bank", default="mnemosyne")
+    p.add_argument("--bank", choices=("mnemosyne", "auto"), default="mnemosyne")
     p.set_defaults(func=_cmd_confirm_like)
 
     p = sub.add_parser("reject-preference", help="Reject inferred preference signal")
@@ -84,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--target-id", default="")
     p.add_argument("--note", default="")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--bank", default="mnemosyne")
+    p.add_argument("--bank", choices=("mnemosyne", "auto"), default="mnemosyne")
     p.set_defaults(func=_cmd_reject_pref)
 
     p = sub.add_parser("unconfirm-like", help="Explicit revoke of confirmed likes (not NetEase unsaved)")
@@ -93,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--title", default="")
     p.add_argument("--note", default="")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--bank", default="mnemosyne")
+    p.add_argument("--bank", choices=("mnemosyne", "auto"), default="mnemosyne")
     p.set_defaults(func=_cmd_unconfirm_like)
 
     p = sub.add_parser("monitor", help="Print Monitor snapshot JSON (or --serve with music API)")
@@ -115,13 +126,46 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("disable-auto-sync", help="Cancel recurring auto-sync handle")
     p.set_defaults(func=_cmd_disable_auto_sync)
 
+    for command in sub.choices.values():
+        if "--user" not in command._option_string_actions:
+            command.add_argument("--user", default="owner")
     args = parser.parse_args(argv)
     return int(args.func(args))
+
+
+def _cmd_mcp(args):
+    from music_acquisition.integrations.mcp import MusicToolClient, MusicMcpServer
+    token = os.environ.get("MNEMOSYNE_MUSIC_AGENT_TOKEN", "")
+    if not token:
+        print("MNEMOSYNE_MUSIC_AGENT_TOKEN_required", file=sys.stderr)
+        return 2
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
+    MusicMcpServer(MusicToolClient(base_url=args.url, token=token, owner_user_id=args.user)).serve()
+    return 0
+
+
+def _cmd_configure(args):
+    async def configure():
+        from music_acquisition.engine import MusicAcquisitionEngine
+        from music_acquisition.domain.models import MusicConsent, MusicScopeConfig
+        from pathlib import Path
+        value = json.loads(Path(args.file).read_text(encoding="utf-8"))
+        engine = MusicAcquisitionEngine(_host(args), owner_user_id=args.user)
+        await engine.initialize()
+        await engine.configure_scopes(MusicScopeConfig.model_validate(value["scope_config"]))
+        await engine.set_consent(MusicConsent.model_validate(value["consent"]))
+        await engine.shutdown()
+        return 0
+    return asyncio.run(configure())
 
 
 def _host(args: argparse.Namespace):
     """默认挂到 Mnemosyne Memory Bank；``--data-dir`` / ``MNEMOSYNE_MUSIC_DATA`` 可覆盖。"""
     from music_acquisition.hosts.mnemosyne_node import open_mnemosyne_host
+    if os.environ.get("MNEMOSYNE_MUSIC_HOST_MODE") == "dsh":
+        from music_acquisition.hosts.dsh_host import DshHostRuntime
+        return DshHostRuntime(args.data_dir or None)
 
     root = (args.data_dir or "").strip() or None
     return open_mnemosyne_host(data_dir=root)
@@ -156,6 +200,7 @@ async def _adoctor(args: argparse.Namespace) -> int:
         bank = host.bank_status()
     engine = MusicAcquisitionEngine(
         host,
+        owner_user_id=getattr(args, "user", "owner"),
         mnemosyne_base_url=args.mnemosyne_url,
         mnemosyne_token=args.mnemosyne_token,
     )
@@ -207,7 +252,8 @@ async def _ademo(args: argparse.Namespace) -> int:
     )
     from music_acquisition.engine import MusicAcquisitionEngine
 
-    engine = MusicAcquisitionEngine(_host(args))
+    from music_acquisition.source.mock_adapter import MockNeteaseAdapter
+    engine = MusicAcquisitionEngine(_host(args), source=MockNeteaseAdapter(), owner_user_id=getattr(args, "user", "owner"))
     await engine.initialize()
     ch = await engine.authorize(AuthorizationRequest(owner_user_id=args.user, node_id="cli-demo"))
     st = await engine.get_authorization_status(ch.session_id)
@@ -222,6 +268,10 @@ async def _ademo(args: argparse.Namespace) -> int:
             ],
         )
     )
+    from music_acquisition.domain.models import MusicConsent
+    await engine.set_consent(MusicConsent(consent_id="synthetic-demo", owner_user_id=args.user,
+        node_id=engine._node_id, granted_at=engine._host.clock.now_iso(), scopes=engine._gate.get_scopes(args.user),
+        purposes=["music.data.read", "music.data.cache", "music.data.recall"]))
     run = await engine.sync_now(
         SyncRequest(owner_user_id=args.user, collectors=["liked_songs", "daily_songs"])
     )
@@ -256,6 +306,7 @@ async def _anetease(args: argparse.Namespace) -> int:
 
     engine = MusicAcquisitionEngine(
         _host(args),
+        owner_user_id=getattr(args, "user", "owner"),
         use_real_netease=True,
         favorite_playlist_id="",
         mnemosyne_base_url=args.mnemosyne_url,
@@ -311,7 +362,7 @@ def _cmd_legacy(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "error": "profile_missing"}, ensure_ascii=False))
         return 1
     items = profile_to_evidence_candidates(profile)
-    engine = MusicAcquisitionEngine(_host(args))
+    engine = MusicAcquisitionEngine(_host(args), owner_user_id=getattr(args, "user", "owner"))
     asyncio.run(engine.initialize())
     oid = engine.enqueue_evidence(items)
     print(json.dumps({"ok": True, "outbox_id": oid, "count": len(items)}, ensure_ascii=False, indent=2))
@@ -330,13 +381,16 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     engine = MusicAcquisitionEngine(
         _host(args),
+        owner_user_id=getattr(args, "user", "owner"),
         use_real_netease=bool(args.playlist_id),
         favorite_playlist_id=args.playlist_id,
         mnemosyne_base_url=args.mnemosyne_url,
         mnemosyne_token=args.mnemosyne_token,
     )
     asyncio.run(engine.initialize())
-    app = create_app(engine)
+    if not args.api_token:
+        raise ValueError("MNEMOSYNE_MUSIC_API_TOKEN_required")
+    app = create_app(engine, access_token=args.api_token)
     uvicorn.run(app, host=args.host, port=int(args.port))
     return 0
 
@@ -346,6 +400,7 @@ def _cmd_register_domain(args: argparse.Namespace) -> int:
 
     engine = MusicAcquisitionEngine(
         _host(args),
+        owner_user_id=getattr(args, "user", "owner"),
         mnemosyne_base_url=args.mnemosyne_url,
         mnemosyne_token=args.mnemosyne_token,
     )
@@ -362,6 +417,7 @@ def _cmd_submit_graph(args: argparse.Namespace) -> int:
     dry = not bool(getattr(args, "commit", False))
     engine = MusicAcquisitionEngine(
         _host(args),
+        owner_user_id=getattr(args, "user", "owner"),
         mnemosyne_base_url=args.mnemosyne_url,
         mnemosyne_token=args.mnemosyne_token,
     )
@@ -388,12 +444,12 @@ async def _abootstrap(args: argparse.Namespace) -> int:
 
     engine = MusicAcquisitionEngine(
         _host(args),
+        owner_user_id=getattr(args, "user", "owner"),
         use_real_netease=True,
         favorite_playlist_id=str(args.playlist_id or ""),
         mnemosyne_base_url=args.mnemosyne_url,
         mnemosyne_token=args.mnemosyne_token,
         memory_bank_kind=str(args.bank or "mnemosyne"),
-        owner_user_id=str(args.user),
     )
     await engine.initialize()
     result = await engine.bootstrap_pipeline(
@@ -416,6 +472,7 @@ def _cmd_confirm_like(args: argparse.Namespace) -> int:
 
     engine = MusicAcquisitionEngine(
         _host(args),
+        owner_user_id=getattr(args, "user", "owner"),
         mnemosyne_base_url=args.mnemosyne_url,
         mnemosyne_token=args.mnemosyne_token,
         memory_bank_kind=str(args.bank or "mnemosyne"),
@@ -438,6 +495,7 @@ def _cmd_reject_pref(args: argparse.Namespace) -> int:
 
     engine = MusicAcquisitionEngine(
         _host(args),
+        owner_user_id=getattr(args, "user", "owner"),
         mnemosyne_base_url=args.mnemosyne_url,
         mnemosyne_token=args.mnemosyne_token,
         memory_bank_kind=str(args.bank or "mnemosyne"),
@@ -459,6 +517,7 @@ def _cmd_unconfirm_like(args: argparse.Namespace) -> int:
 
     engine = MusicAcquisitionEngine(
         _host(args),
+        owner_user_id=getattr(args, "user", "owner"),
         mnemosyne_base_url=args.mnemosyne_url,
         mnemosyne_token=args.mnemosyne_token,
         memory_bank_kind=str(args.bank or "mnemosyne"),
@@ -481,9 +540,11 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
 
     engine = MusicAcquisitionEngine(
         _host(args),
+        owner_user_id=getattr(args, "user", "owner"),
         mnemosyne_base_url=args.mnemosyne_url,
         mnemosyne_token=args.mnemosyne_token,
-        memory_bank_kind="local_file",
+        use_real_netease=True,
+        memory_bank_kind="mnemosyne",
     )
     asyncio.run(engine.initialize())
     snap = engine.monitor_snapshot()
@@ -498,7 +559,9 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
         return 2
     from music_acquisition.api import create_app
 
-    app = create_app(engine)
+    if not args.api_token:
+        raise ValueError("MNEMOSYNE_MUSIC_API_TOKEN_required")
+    app = create_app(engine, access_token=args.api_token)
     print(f"Monitor UI → http://{args.host}:{args.port}/monitor/", flush=True)
     uvicorn.run(app, host=args.host, port=int(args.port))
     return 0
@@ -513,13 +576,13 @@ async def _aprobe_artists(args: argparse.Namespace) -> int:
 
     engine = MusicAcquisitionEngine(
         _host(args),
+        owner_user_id=getattr(args, "user", "owner"),
         use_real_netease=True,
         mnemosyne_base_url=args.mnemosyne_url,
         mnemosyne_token=args.mnemosyne_token,
-        owner_user_id="owner",
     )
     await engine.initialize()
-    await engine._auth.restore_credentials("owner")
+    await engine._auth.restore_credentials(engine._owner_user_id)
     src = engine.source
     getter = getattr(src, "get_favorite_artists", None)
     if not callable(getter):
@@ -551,6 +614,7 @@ async def _aenable_auto_sync(args: argparse.Namespace) -> int:
 
     engine = MusicAcquisitionEngine(
         _host(args),
+        owner_user_id=getattr(args, "user", "owner"),
         use_real_netease=True,
         mnemosyne_base_url=args.mnemosyne_url,
         mnemosyne_token=args.mnemosyne_token,
@@ -587,6 +651,7 @@ async def _adisable_auto_sync(args: argparse.Namespace) -> int:
 
     engine = MusicAcquisitionEngine(
         _host(args),
+        owner_user_id=getattr(args, "user", "owner"),
         mnemosyne_base_url=args.mnemosyne_url,
         mnemosyne_token=args.mnemosyne_token,
     )

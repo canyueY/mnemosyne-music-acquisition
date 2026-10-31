@@ -258,6 +258,7 @@ py -3 -m music_acquisition.cli serve --port 8770
 | [MUSIC_DOMAIN_INTEGRATION_CONTRACT.md](docs/MUSIC_DOMAIN_INTEGRATION_CONTRACT.md) | 与 Node / Domain 契约 |
 | [MUSIC_SOURCE_CAPABILITY_MATRIX.md](docs/MUSIC_SOURCE_CAPABILITY_MATRIX.md) | 源能力矩阵 |
 | [GA_CHECKLIST.md](docs/GA_CHECKLIST.md) | 验收清单 |
+| [FINAL_ACCEPTANCE_2026_11_01.md](docs/FINAL_ACCEPTANCE_2026_11_01.md) | 最终离线验收、独立运行包与实机待验项 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本记录 |
 
 ---

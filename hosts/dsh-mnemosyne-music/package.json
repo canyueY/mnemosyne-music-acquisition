@@ -1,7 +1,7 @@
 {
   "name": "@canyuey/dsh-mnemosyne-music",
   "version": "0.5.0",
-  "description": "DSH host bridge for mnemosyne-music-acquisition (spawns Python HostRuntime; not a full Cordis marketplace plugin)",
+  "description": "DSH HostRuntime bridge and business tools for Mnemosyne Music Acquisition",
   "license": "AGPL-3.0-or-later",
   "main": "index.js",
   "bin": {
@@ -10,7 +10,9 @@
   "files": [
     "index.js",
     "bin/",
-    "README.md"
+    "README.md",
+    "business-tools.json",
+    "runtime/"
   ],
   "engines": {
     "node": ">=18"

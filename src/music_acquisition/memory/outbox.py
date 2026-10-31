@@ -44,6 +44,12 @@ class EvidenceOutbox:
             "item_stats": {"pending": len(items), "submitted": 0, "failed": 0},
         }
         with self._lock():
+            index = self._host.local_storage.read_json("memory/outbox/_index.json") or {"ids": []}
+            if idempotency_key:
+                for existing_id in index.get("ids", []):
+                    previous = self.load(existing_id)
+                    if previous and previous.get("idempotency_key") == idempotency_key:
+                        return existing_id
             self._host.local_storage.write_json(f"memory/outbox/{oid}.json", payload)
             index = self._host.local_storage.read_json("memory/outbox/_index.json") or {"ids": []}
             ids = list(index.get("ids") or [])

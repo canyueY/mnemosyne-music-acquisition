@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Windows 时区依赖**：增加 `tzdata`，修复 Python 3.13 上 `ZoneInfo("Asia/Shanghai")` 缺失导致的 6 项测试失败
+- **DSH 桥业务工具**：补齐缺失的 `music_sync_status`，业务工具从 9 项恢复为 10 项
+- **独立运行包**：新增 `scripts/build_standalone.py` 构建说明与 PyInstaller 构建依赖；已验证脱离 Python 环境启动
+- **最终验收**：新增 `docs/FINAL_ACCEPTANCE_2026_11_01.md`；离线测试 62 passed / 2 skipped，DSH 桥 2 passed
+
 ## 0.5.0
 
 - **Cookie at-rest 加密**：Fernet `ENC1:` + OS keyring（可选 `[secure]`）或本地 `.master.key`；明文自动升级

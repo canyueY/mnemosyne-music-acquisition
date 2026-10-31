@@ -19,14 +19,20 @@
       "mnemosyne.service.optional"
     ]
   },
-  "protocols": ["mnemosyne-component-v1", "music-acquisition-v1"],
+  "protocols": [
+    "mnemosyne-component-v1",
+    "music-acquisition-v1"
+  ],
   "permissions": [
-    "music.read.liked_songs",
-    "music.read.playlists",
-    "music.read.daily_recommendations",
-    "music.read.history",
-    "music.submit.evidence",
-    "music.play"
+    "music.profile.basic",
+    "music.library.liked_songs",
+    "music.library.playlists",
+    "music.library.playlist_tracks",
+    "music.library.favorite_artists",
+    "music.recommend.daily_songs",
+    "music.recommend.daily_playlists",
+    "music.history.playback",
+    "music.playback.control"
   ],
   "domain_packs": [
     "domain/music_domain_pack.v1.json"
@@ -41,7 +47,27 @@
   "entry": {
     "package": "music_acquisition",
     "cli": "mnemosyne-music",
-    "http": "/api/music/v1"
+    "http": "/api/music/v1",
+    "standalone": {
+      "executable": "mnemosyne-music.exe",
+      "arguments": [
+        "serve"
+      ],
+      "host_provides_env": [
+        "MNEMOSYNE_MUSIC_API_TOKEN",
+        "MNEMOSYNE_MUSIC_AGENT_TOKEN",
+        "MNEMOSYNE_BASE_URL",
+        "DSH_MEMORY_TOKEN"
+      ]
+    },
+    "mcp": {
+      "arguments": [
+        "mcp",
+        "--url",
+        "http://127.0.0.1:8770"
+      ],
+      "protocol_version": "2025-06-18"
+    }
   },
-  "notes": "Install registers Music Domain ontology only; user music sync requires separate authorize + scopes."
+  "notes": "Mnemosyne first-party component; platform endpoints are external web interfaces. Scopes default off; collection requires account authorization and explicit Consent. Agent tools cannot grant Consent."
 }

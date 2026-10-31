@@ -1,0 +1,208 @@
+[
+  {
+    "name": "music_get_capabilities",
+    "method": "GET",
+    "path": "capabilities",
+    "body": false,
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "music_sync",
+    "method": "POST",
+    "path": "acquisition/sync",
+    "body": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "collectors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "playlist_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "force_refresh": {
+          "type": "boolean"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "music_sync_status",
+    "method": "GET",
+    "path": "sync/status",
+    "body": false,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "music_get_snapshot",
+    "method": "GET",
+    "path": "snapshots",
+    "body": false,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "data_type": {
+          "type": "string"
+        },
+        "subject_id": {
+          "type": "string"
+        },
+        "local_date": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data_type",
+        "subject_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "music_recall",
+    "method": "POST",
+    "path": "recall",
+    "body": false,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "subject_id": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "music_play_song",
+    "method": "POST",
+    "path": "playback/song",
+    "body": false,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "track_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "track_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "music_play_playlist",
+    "method": "POST",
+    "path": "playback/playlist",
+    "body": false,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "playlist_id": {
+          "type": "string"
+        },
+        "track_id": {
+          "type": "string"
+        },
+        "index": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "playlist_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "music_play_daily",
+    "method": "POST",
+    "path": "playback/daily",
+    "body": false,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "date": {
+          "type": "string"
+        },
+        "track_id": {
+          "type": "string"
+        },
+        "index": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "date"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "music_next",
+    "method": "POST",
+    "path": "playback/next",
+    "body": false,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "delta": {
+          "type": "integer"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "music_roundtrip_lookup",
+    "method": "POST",
+    "path": "playlist/roundtrip",
+    "body": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "scope_key": {
+          "type": "string"
+        },
+        "index_1based": {
+          "type": "integer"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  }
+]

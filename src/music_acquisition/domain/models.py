@@ -118,6 +118,7 @@ class AuthorizationRequest(BaseModel):
     node_id: str = "local-node"
     provider: str = "netease"
     scopes: list[str] = Field(default_factory=list)
+    mode: Literal["qr", "config_bind"] = "qr"
 
 
 class AuthorizationChallenge(BaseModel):
@@ -127,6 +128,8 @@ class AuthorizationChallenge(BaseModel):
     qr_url: str = ""
     expires_at: str = ""
     status: str = "waiting_scan"
+    state_nonce: str = ""
+    qr_image_data: str | None = None
 
 
 class AuthorizationSession(BaseModel):
@@ -190,6 +193,8 @@ class SyncRequest(BaseModel):
         "retry",
     ] = "manual"
     force_refresh: bool = False
+    playlist_ids: list[str] = Field(default_factory=list)
+    recovery_run_id: str | None = None
 
 
 class SyncRun(BaseModel):
@@ -206,6 +211,11 @@ class SyncRun(BaseModel):
     error_code: str | None = None
     warnings: list[str] = Field(default_factory=list)
     snapshot_ids: list[str] = Field(default_factory=list)
+    collector_results: dict[str, Any] = Field(default_factory=dict)
+    consent_id: str | None = None
+    policy_version: str | None = None
+    subject_id: str | None = None
+    next_retry_at: str | None = None
 
 
 class SyncStatus(BaseModel):
@@ -213,6 +223,8 @@ class SyncStatus(BaseModel):
     status: str
     detail: str = ""
     active_locks: list[str] = Field(default_factory=list)
+    next_retry_at: str | None = None
+    recovered_as: str | None = None
 
 
 class SourceCapabilities(BaseModel):
@@ -220,6 +232,7 @@ class SourceCapabilities(BaseModel):
     features: dict[str, bool] = Field(default_factory=dict)
     limitations: list[str] = Field(default_factory=list)
     verified_at: str = ""
+    verification_status: str = "implemented_unverified"
 
 
 class EngineStatus(BaseModel):

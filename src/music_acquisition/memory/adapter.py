@@ -51,6 +51,9 @@ class MusicMemoryAdapter:
         imported_at = self._host.clock.now_iso()
 
         for rec in snapshot.records:
+            aggregate = isinstance(rec, dict) and rec.get("record_kind") == "play_count_aggregate"
+            record_etype = "music.play_count_observed" if aggregate else etype
+            record_action = "play_count_observed" if aggregate else action
             tid = ""
             title = ""
             artists: Any = ""
@@ -91,7 +94,7 @@ class MusicMemoryAdapter:
             evidence.append(
                 {
                     "evidence_id": f"ev_{secrets.token_hex(6)}",
-                    "evidence_type": etype,
+                    "evidence_type": record_etype,
                     "subject_type": default_target,
                     "subject_id": tid,
                     "source": "music_acquisition",
@@ -103,10 +106,12 @@ class MusicMemoryAdapter:
                     "source_app": str(snapshot.provider or "netease"),
                     "source_record_id": tid,
                     "data_kind": data_kind,
-                    "action": action,
+                    "action": record_action,
                     "target_type": default_target,
                     "target_id": tid,
-                    "occurred_at": snapshot.fetched_at,
+                    "occurred_at": (rec.get("played_at") or rec.get("occurred_at")) if isinstance(rec, dict) else None,
+                    "temporal_precision": "aggregate_period" if aggregate else "snapshot_observation",
+                    "aggregate": {k: rec.get(k) for k in ("period", "play_count", "coverage")} if aggregate else None,
                     "imported_at": imported_at,
                     "status": "observed",
                     "evidence_refs": [],

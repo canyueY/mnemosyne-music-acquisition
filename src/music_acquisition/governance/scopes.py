@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 from music_acquisition.domain.models import MusicConsent, MusicScopeConfig
+from music_acquisition.util.runtime import active_until
+
+ALL_PURPOSES = {"music.data.read", "music.data.cache", "music.data.submit_evidence", "music.data.create_memory", "music.data.recall", "music.data.export", "music.data.delete"}
 
 ALL_SCOPES = [
     "music.profile.basic",
@@ -55,8 +58,21 @@ class PermissionGate:
         return all(s in have for s in needed)
 
     def set_consent(self, consent: MusicConsent) -> None:
+        if set(consent.scopes) - set(ALL_SCOPES) or set(consent.purposes) - ALL_PURPOSES:
+            raise ValueError("unknown_consent_scope_or_purpose")
         self._consents[consent.owner_user_id] = consent
 
     def consent_active(self, owner_user_id: str) -> bool:
         c = self._consents.get(owner_user_id)
-        return bool(c and c.status == "active")
+        return bool(c and c.status == "active" and active_until(c.expires_at))
+
+    def consent(self, owner):
+        return self._consents.get(owner)
+
+    def allows(self, owner, *, collector=None, purpose="music.data.read"):
+        c = self._consents.get(owner)
+        if not self.consent_active(owner) or purpose not in c.purposes:
+            return False
+        if collector:
+            return self.allow_collector(owner, collector) and set(COLLECTOR_SCOPES.get(collector, ["unknown"])).issubset(c.scopes)
+        return True

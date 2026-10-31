@@ -11,8 +11,10 @@ from music_acquisition.domain.models import (
     MusicScopeConfig,
     SyncRequest,
 )
+from test_audit_compliance import consent
 from music_acquisition.engine import MusicAcquisitionEngine
 from music_acquisition.hosts.in_memory import InMemoryHostRuntime
+from music_acquisition.util.runtime import local_date
 from music_acquisition.snapshot.hashing import snapshot_hash
 from music_acquisition.snapshot.manager import SnapshotManager
 from music_acquisition.source.mock_adapter import MockNeteaseAdapter
@@ -21,7 +23,7 @@ from music_acquisition.source.mock_adapter import MockNeteaseAdapter
 class EngineContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.host = InMemoryHostRuntime()
-        self.engine = MusicAcquisitionEngine(self.host, source=MockNeteaseAdapter(liked_count=4))
+        self.engine = MusicAcquisitionEngine(self.host, source=MockNeteaseAdapter(liked_count=4), owner_user_id="u1")
 
     def test_initialize_without_dsh(self) -> None:
         st = asyncio.run(self.engine.initialize())
@@ -54,6 +56,7 @@ class EngineContractTests(unittest.TestCase):
                     scopes=["music.library.liked_songs", "music.recommend.daily_songs"],
                 )
             )
+            await consent(self.engine)
             run = await self.engine.sync_now(
                 SyncRequest(owner_user_id="u1", collectors=["liked_songs", "daily_songs"])
             )
@@ -72,7 +75,7 @@ class EngineContractTests(unittest.TestCase):
             daily = await self.engine.get_snapshots(
                 data_type="daily_songs",
                 subject_id="mock_uid_1",
-                local_date=self.host.clock.now_iso()[:10],
+                local_date=local_date(self.host.clock),
             )
             self.assertTrue(daily)
             ev = self.engine.map_to_evidence(daily[0])

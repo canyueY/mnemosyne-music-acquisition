@@ -17,6 +17,7 @@ from music_acquisition.domain.models import (
     SyncRequest,
     SyncRun,
     SyncStatus,
+    MusicConsent,
 )
 from music_acquisition.governance.scopes import PermissionGate
 from music_acquisition.memory.adapter import MusicMemoryAdapter
@@ -41,8 +42,9 @@ from music_acquisition.snapshot.ttl import mark_expired_if_needed
 from music_acquisition.source.mock_adapter import MockNeteaseAdapter
 from music_acquisition.source.netease.adapter import NeteaseSourceAdapter
 from music_acquisition.sync.coordinator import SyncCoordinator
-from music_acquisition.sync.recovery import startup_recovery_requests
+from music_acquisition.sync.recovery import startup_recovery_requests, list_pending_run_ids
 from music_acquisition.version import __version__
+from music_acquisition.util.runtime import audit, local_date as current_local_date
 
 
 class MusicAcquisitionEngine:
@@ -54,7 +56,7 @@ class MusicAcquisitionEngine:
         node_id: str = "local-node",
         mnemosyne_base_url: str = "",
         mnemosyne_token: str = "",
-        use_real_netease: bool = False,
+        use_real_netease: bool = True,
         favorite_playlist_id: str = "",
         memory_bank_kind: str = "mnemosyne",
         owner_user_id: str = "owner",
@@ -62,17 +64,22 @@ class MusicAcquisitionEngine:
         self._host = host
         self._node_id = node_id
         self._owner_user_id = owner_user_id
+        if memory_bank_kind not in {"mnemosyne", "auto"}:
+            raise ValueError("Mnemosyne_is_the_only_long_term_authority")
         if source is not None:
             self._source = source
         elif use_real_netease or favorite_playlist_id:
             self._source = NeteaseSourceAdapter(favorite_playlist_id=favorite_playlist_id or None)
         else:
             self._source = MockNeteaseAdapter()
+        checkpoint = getattr(self._source, "set_checkpoint_store", None)
+        if callable(checkpoint):
+            checkpoint(host.local_storage)
         self._gate = PermissionGate()
         self._snapshots = SnapshotManager(host)
-        self._auth = AuthManager(host, self._source)
+        self._auth = AuthManager(host, self._source, owner_user_id=owner_user_id)
         self._sync = SyncCoordinator(
-            host, self._source, self._snapshots, self._gate, node_id=node_id
+            host, self._source, self._snapshots, self._gate, node_id=node_id, owner_user_id=owner_user_id
         )
         self._memory = MusicMemoryAdapter(host)
         self._outbox = EvidenceOutbox(host)
@@ -84,24 +91,23 @@ class MusicAcquisitionEngine:
         from pathlib import Path
 
         local_bank = Path(host.local_storage.root()) / "memory_bank_mirror"
-        try:
-            self._bank: MemoryBankBackend | None = open_memory_bank(
-                memory_bank_kind if (mnemosyne_base_url or memory_bank_kind == "local_file") else "local_file",
+        self._bank: MemoryBankBackend | None = None
+        if mnemosyne_base_url:
+            self._bank = open_memory_bank(
+                "mnemosyne",
                 mnemosyne_base_url=mnemosyne_base_url,
                 mnemosyne_token=mnemosyne_token,
                 local_root=local_bank,
                 audit_root=local_bank / "audit",
                 client=self._mnemosyne,
             )
-        except ValueError:
-            self._bank = open_memory_bank("local_file", local_root=local_bank)
         self._submitter = EvidenceSubmitter(host, self._mnemosyne, self._outbox)
         self._recall = MusicRecallService(host, mnemosyne=self._mnemosyne)
         self._graph = MusicGraphBuilder(self._mnemosyne)
         self._prefs = PreferenceSignalPublisher(self._mnemosyne)
         scopes_root = Path(host.local_storage.root()) / "playlist_scopes"
         self._scope_store = get_store(scopes_root)
-        self._playback = MusicPlaybackService(scope_store=self._scope_store)
+        self._playback = MusicPlaybackService(scope_store=self._scope_store, authorize=self._playback_allowed, snapshot_resolver=self._resolve_playback_target)
         self._claims = ClaimBridge(client=self._mnemosyne, bank=self._bank)
         self._user_anchor_id = ""
         self._initialized = False
@@ -112,11 +118,30 @@ class MusicAcquisitionEngine:
         return self._source
 
     async def initialize(self) -> EngineStatus:
+        from pathlib import Path
+        from music_acquisition.util.file_lock import FileLock
+        import json
+        with FileLock(Path(self._host.local_storage.root()) / "config/.owner.lock"):
+            owner = self._host.local_storage.read_json("config/owner.json")
+            if owner and (owner.get("owner_user_id") != self._owner_user_id or owner.get("node_id", self._node_id) != self._node_id):
+                raise PermissionError("DATA_ROOT_OWNER_MISMATCH")
+            if not owner:
+                for file in (Path(self._host.local_storage.root()) / "snapshots").rglob("*.json"):
+                    prior = json.loads(file.read_text(encoding="utf-8"))
+                    if prior.get("owner_user_id") != self._owner_user_id:
+                        raise PermissionError("LEGACY_OWNER_MIGRATION_REQUIRED")
+            self._host.local_storage.write_json("config/owner.json", {"owner_user_id": self._owner_user_id, "node_id": self._node_id})
+        raw_scope = self._host.local_storage.read_json(f"config/scopes_{self._owner_user_id}.json")
+        if raw_scope:
+            self._gate.configure(MusicScopeConfig.model_validate(raw_scope))
+        raw_consent = self._host.local_storage.read_json(f"config/consent_{self._owner_user_id}.json")
+        if raw_consent:
+            self._gate.set_consent(MusicConsent.model_validate(raw_consent))
         # Restore QR cookie from Memory Bank credentials if present
         try:
             await self._auth.restore_credentials(self._owner_user_id)
         except Exception as exc:  # noqa: BLE001
-            self._host.logger.warning("credential_restore_failed", error=str(exc))
+            self._host.logger.warning("credential_restore_failed", error_code=type(exc).__name__)
         caps = await self._source.get_capabilities()
         auth = await self._source.check_authorization()
         self._initialized = True
@@ -135,6 +160,9 @@ class MusicAcquisitionEngine:
             },
         )
         self._host.logger.info("engine_initialized", data_root=root)
+        schedule = self._host.local_storage.read_json("config/auto_sync.json") or {}
+        if schedule.get("enabled") and self._gate.consent_active(self._owner_user_id) and auth.status in {"valid", "authorized"}:
+            self.enable_auto_sync(interval_sec=schedule.get("interval_sec", 86400), collectors=schedule.get("collectors"), submit=schedule.get("submit", False))
         return EngineStatus(
             ok=True,
             version=__version__,
@@ -155,8 +183,16 @@ class MusicAcquisitionEngine:
         *,
         favorite_playlist_id: str | int,
         subject_id: str | None = None,
+        state_nonce: str | None = None,
     ) -> AuthorizationStatus:
         self._ensure_init()
+        session = self._auth._sessions.get(session_id)
+        if not session or session.user_id != self._owner_user_id:
+            raise PermissionError("SESSION_DENIED")
+        from music_acquisition.util.runtime import active_until
+        import secrets
+        if not active_until(session.expires_at) or session.status in {"cancelled", "expired"} or (state_nonce is not None and not secrets.compare_digest(state_nonce, session.state_nonce)):
+            raise PermissionError("SESSION_DENIED")
         bind = getattr(self._source, "complete_config_bind", None)
         if not callable(bind):
             return AuthorizationStatus(
@@ -167,42 +203,130 @@ class MusicAcquisitionEngine:
         return bind(session_id, favorite_playlist_id=favorite_playlist_id, subject_id=subject_id)
 
     async def get_authorization_status(
-        self, session_id: str | None = None
+        self, session_id: str | None = None, *, state_nonce=None
     ) -> AuthorizationStatus:
         self._ensure_init()
-        return await self._auth.get_status(session_id)
+        return await self._auth.get_status(session_id, state_nonce=state_nonce)
 
     async def revoke_authorization(self, subject_id: str) -> None:
         self._ensure_init()
         await self._auth.revoke(subject_id)
+        self.disable_auto_sync()
+        consent = self._gate.consent(self._owner_user_id)
+        if consent:
+            await self.set_consent(consent.model_copy(update={"status": "revoked"}))
 
     async def configure_scopes(self, config: MusicScopeConfig) -> None:
         self._ensure_init()
+        self._assert_owner(config.owner_user_id)
         self._gate.configure(config)
+        old_consent = self._gate.consent(config.owner_user_id)
+        if old_consent:
+            await self.set_consent(old_consent.model_copy(update={"status": "revoked"}))
         self._host.local_storage.write_json(
             f"config/scopes_{config.owner_user_id}.json",
             config.model_dump(mode="json"),
         )
+        audit(self._host, "scopes_changed", owner=config.owner_user_id, scope_count=len(config.scopes))
+
+    def _assert_owner(self, owner):
+        if owner != self._owner_user_id:
+            raise PermissionError("OWNER_DENIED")
+
+    async def set_consent(self, consent: MusicConsent):
+        self._assert_owner(consent.owner_user_id)
+        if consent.node_id != self._node_id:
+            raise PermissionError("NODE_DENIED")
+        self._gate.set_consent(consent)
+        self._host.local_storage.write_json(f"config/consent_{self._owner_user_id}.json", consent.model_dump(mode="json"))
+        audit(self._host, "consent_changed", owner=self._owner_user_id, consent_id=consent.consent_id, status=consent.status)
+        return {"ok": True}
+
+    def _require_purpose(self, purpose):
+        raw = self._host.local_storage.read_json(f"config/consent_{self._owner_user_id}.json")
+        if raw:
+            self._gate.set_consent(MusicConsent.model_validate(raw))
+        if not self._gate.allows(self._owner_user_id, purpose=purpose):
+            raise PermissionError("PURPOSE_OR_CONSENT_DENIED")
+
+    def _playback_allowed(self):
+        raw = self._host.local_storage.read_json(f"config/consent_{self._owner_user_id}.json")
+        config = self._host.local_storage.read_json(f"config/scopes_{self._owner_user_id}.json")
+        if raw:
+            self._gate.set_consent(MusicConsent.model_validate(raw))
+        if config:
+            self._gate.configure(MusicScopeConfig.model_validate(config))
+        consent = self._gate.consent(self._owner_user_id)
+        return bool(consent and self._gate.consent_active(self._owner_user_id) and "music.playback.control" in consent.scopes
+            and "music.playback.control" in self._gate.get_scopes(self._owner_user_id)
+            and not (self._host.local_storage.read_json(f"auth/revoked_{self._owner_user_id}.json") or {}).get("revoked"))
+
+    def _resolve_playback_target(self, kind, *, playlist_id=None, date=None, track_id=None, index=None, current_track_id=None, delta=1):
+        self._require_purpose("music.data.read")
+        from music_acquisition.util.runtime import active_until
+        normalize = lambda value: str(value or "").removeprefix("netease:")
+        binding = self._host.local_storage.read_json(f"auth/credential_index_{self._owner_user_id}.json") or {}
+        subject = binding.get("subject_id") or getattr(self._source, "subject_id", getattr(self._source, "_subject_id", ""))
+        today = current_local_date(self._host.clock)
+        if kind == "daily":
+            if date != today:
+                return {"ok": False, "error": "SNAPSHOT_EXPIRED"}
+            snap = self._snapshots.load("daily_songs", subject, date)
+            scope = {"kind": "daily", "date": date}
+        else:
+            snap = self._snapshots.load("playlist_tracks", subject)
+            if not snap and normalize(playlist_id) == normalize(getattr(self._source, "favorite_playlist_id", "")):
+                snap = self._snapshots.load("liked_songs", subject)
+            scope = {"kind": "playlist", "playlist_id": playlist_id}
+        if not snap or not snap.complete or snap.status != "complete":
+            return {"ok": False, "error": "SNAPSHOT_INCOMPLETE"}
+        if not active_until(snap.expires_at):
+            return {"ok": False, "error": "SNAPSHOT_EXPIRED"}
+        rows = snap.records
+        if snap.data_type == "playlist_tracks":
+            rows = [r for r in rows if normalize(r.get("parent_playlist_id")) == normalize(playlist_id)]
+        ids = [normalize(r.get("provider_track_id") or r.get("track_id")) for r in rows]
+        if not ids:
+            return {"ok": False, "error": "EMPTY_PLAYLIST"}
+        if current_track_id is not None:
+            if normalize(current_track_id) not in ids:
+                return {"ok": False, "error": "PLAY_SOURCE_MISMATCH"}
+            position = (ids.index(normalize(current_track_id)) + int(delta)) % len(ids)
+        elif track_id is not None:
+            if normalize(track_id) not in ids:
+                return {"ok": False, "error": "TRACK_NOT_IN_PLAYLIST"}
+            position = ids.index(normalize(track_id))
+        else:
+            position = int(index or 1) - 1
+            if position < 0 or position >= len(ids):
+                return {"ok": False, "error": "INDEX_OUT_OF_RANGE"}
+        return {"ok": True, "track_id": ids[position], "index": position + 1, "snapshot_id": snap.snapshot_id, "scope": scope}
 
     async def sync_now(self, request: SyncRequest) -> SyncRun:
         self._ensure_init()
-        auth = await self._source.check_authorization()
-        subject = auth.subject_id or "unknown"
+        self._assert_owner(request.owner_user_id)
+        binding = self._host.local_storage.read_json(f"auth/credential_index_{self._owner_user_id}.json") or {}
+        subject = binding.get("subject_id") or getattr(self._source, "subject_id", getattr(self._source, "_subject_id", "unknown"))
         # Capture previous liked snapshot for revoke diff (before sync overwrites)
         prev_liked = self._snapshots.load("liked_songs", subject)
         run = await self._sync.sync_now(request)
+        subject = run.subject_id or subject
+        if run.next_retry_at:
+            self._schedule_recovery(run.run_id, run.next_retry_at)
         revoke_summary: dict | None = None
         for dt in run.collectors:
-            local_date = self._host.clock.now_iso()[:10] if dt == "daily_songs" else None
-            snaps = await self.get_snapshots(data_type=dt, subject_id=subject, local_date=local_date)
+            date = current_local_date(self._host.clock) if dt in {"daily_songs", "daily_playlists"} else None
+            snap = self._snapshots.load(dt, subject, date)
+            snaps = [snap] if snap and snap.snapshot_id in run.snapshot_ids and snap.complete and run.collector_results.get(dt, {}).get("status") == "success" else []
             for snap in snaps:
                 # Authorized sync may propose candidate memories for saved tracks only
                 # (never auto likes / confirmed preference).
-                items = self._memory.map_snapshot_to_evidence(snap, allow_create_memory=True)
+                allowed = self._gate.allows(self._owner_user_id, purpose="music.data.submit_evidence")
+                items = self._memory.map_snapshot_to_evidence(snap, allow_create_memory=self._gate.allows(self._owner_user_id, purpose="music.data.create_memory")) if allowed else []
                 if items:
-                    self._outbox.enqueue(items, idempotency_key=f"{run.run_id}:{snap.snapshot_id}")
+                    self._outbox.enqueue(items, idempotency_key=f"snapshot:{snap.snapshot_id}")
             # Incremental unfavorite / removed tracks → revoke evidence + supersede saves
-            if dt == "liked_songs" and prev_liked and snaps:
+            if dt == "liked_songs" and prev_liked and snaps and self._gate.allows(self._owner_user_id, purpose="music.data.submit_evidence"):
                 cur = snaps[0]
                 diff = self._snapshots.diff_against_previous(previous=prev_liked, current=cur)
                 revoke_items = diff_to_revoke_evidence(diff)
@@ -214,7 +338,7 @@ class MusicAcquisitionEngine:
                         self._bank,
                         revoke_items,
                         user_anchor_id=self._user_anchor_id,
-                        dry_run=not bool(self._bank),
+                        dry_run=not bool(self._bank) or not self._gate.allows(self._owner_user_id, purpose="music.data.create_memory"),
                     )
                     self._host.local_storage.write_json(
                         f"sync/last_revoke_{run.run_id}.json",
@@ -229,8 +353,23 @@ class MusicAcquisitionEngine:
             )
         return run
 
+    def _schedule_recovery(self, run_id, at):
+        from music_acquisition.util.runtime import parse_time
+        delay = max(0.1, (parse_time(at) - parse_time(self._host.clock.now_iso())).total_seconds())
+        def retry():
+            import asyncio
+            if self._initialized:
+                asyncio.run(self.recover_startup(self._owner_user_id))
+        self._host.task_scheduler.schedule("retry_" + run_id, delay, retry)
+
     async def recover_startup(self, owner_user_id: str) -> list[SyncRun]:
         self._ensure_init()
+        self._assert_owner(owner_user_id)
+        from music_acquisition.util.runtime import parse_time
+        for rid in list_pending_run_ids(self._host):
+            row = self._host.local_storage.read_json(f"sync/runs/{rid}.json") or {}
+            if row.get("owner_user_id") == owner_user_id and row.get("next_retry_at") and parse_time(row["next_retry_at"]) > parse_time(self._host.clock.now_iso()):
+                self._schedule_recovery(rid, row["next_retry_at"])
         runs: list[SyncRun] = []
         for req in startup_recovery_requests(self._host, owner_user_id):
             runs.append(await self.sync_now(req))
@@ -244,10 +383,16 @@ class MusicAcquisitionEngine:
         self, *, data_type: str, subject_id: str, local_date: str | None = None
     ) -> list[MusicSnapshot]:
         self._ensure_init()
+        self._require_purpose("music.data.read")
+        if data_type in {"daily_songs", "daily_playlists"} and local_date is None:
+            local_date = current_local_date(self._host.clock)
         snap = self._snapshots.load(data_type, subject_id, local_date)
         if not snap:
             return []
-        snap = mark_expired_if_needed(snap, tz_name=self._host.clock.timezone())
+        if snap.owner_user_id != self._owner_user_id:
+            raise PermissionError("OWNER_DENIED")
+        self._require_purpose("music.data.read")
+        snap = mark_expired_if_needed(snap, tz_name=self._host.clock.timezone(), today=current_local_date(self._host.clock))
         return [snap]
 
     async def get_diff(
@@ -259,12 +404,14 @@ class MusicAcquisitionEngine:
         current: MusicSnapshot,
     ) -> MusicDiff:
         self._ensure_init()
+        self._require_purpose("music.data.read")
         return self._snapshots.diff_against_previous(previous=previous, current=current)
 
     def map_to_evidence(self, snapshot: MusicSnapshot, **kwargs):
         return self._memory.map_snapshot_to_evidence(snapshot, **kwargs)
 
     def enqueue_evidence(self, items: list) -> str:
+        self._require_purpose("music.data.submit_evidence")
         return self._outbox.enqueue(items)
 
     def submit_evidence_outbox(
@@ -276,6 +423,9 @@ class MusicAcquisitionEngine:
         user_anchor_memory_id: str = "",
     ) -> dict:
         """Submit outbox observations; optionally promote graph / inferred prefs (never likes)."""
+        self._require_purpose("music.data.submit_evidence")
+        if promote_graph or publish_preference_signals:
+            self._require_purpose("music.data.create_memory")
         submit = self._submitter.submit_pending()
         pending_items: list = []
         for batch in self._outbox.list_pending():
@@ -323,7 +473,7 @@ class MusicAcquisitionEngine:
         import json
         from pathlib import Path
 
-        candidates: list[Path] = []
+        candidates: list[Path] = [Path(__file__).resolve().parents[1] / "resources" / "music_domain_pack.v1.json"]
         if pack_path:
             candidates.append(Path(pack_path))
         candidates.extend(
@@ -363,6 +513,7 @@ class MusicAcquisitionEngine:
         return {**result, "pack_path": used}
 
     def promote_music_graph(self, *, dry_run: bool = True, user_anchor_memory_id: str = "") -> dict:
+        self._require_purpose("music.data.create_memory")
         items = self._collect_recent_evidence_items()
         anchor = user_anchor_memory_id or self._user_anchor_id
         if not anchor and self._bank:
@@ -375,6 +526,7 @@ class MusicAcquisitionEngine:
         )
 
     def publish_preference_signals(self, *, dry_run: bool = True) -> dict:
+        self._require_purpose("music.data.create_memory")
         items = self._collect_recent_evidence_items()
         return self._prefs.publish(items, dry_run=dry_run or not bool(self._mnemosyne))
 
@@ -384,6 +536,7 @@ class MusicAcquisitionEngine:
         Rejects stale ``lf_*`` anchors when the active bank is Mnemosyne HTTP.
         """
         self._ensure_init()
+        self._require_purpose("music.data.create_memory")
         if not self._bank:
             return {"ok": False, "error": "memory_bank_unavailable"}
         key = subject_key or self._owner_user_id or "self"
@@ -421,15 +574,18 @@ class MusicAcquisitionEngine:
     ) -> dict:
         """Explicit user confirm → likes (requires user_anchor)."""
         self._ensure_init()
+        self._require_purpose("music.data.create_memory")
         if not self._bank:
-            return {"ok": False, "error": "memory_bank_unavailable"}
-        if not self._user_anchor_id:
+            if dry_run:
+                return {"ok": True, "dry_run": True, "submitted": False}
+            return self._pending_operation("confirm_like", target_id=target_id, title=title, target_type=target_type, note=note, evidence_refs=evidence_refs or [])
+        if not self._user_anchor_id and not dry_run:
             self.ensure_user_anchor()
-        if not self._user_anchor_id:
-            return {"ok": False, "error": "user_anchor_missing"}
-        return confirm_preference(
+        if not self._user_anchor_id and not dry_run:
+            return self._pending_operation("confirm_like", target_id=target_id, title=title, target_type=target_type, evidence_refs=evidence_refs, memory_id=memory_id, note=note)
+        result = confirm_preference(
             self._bank,
-            user_anchor_id=self._user_anchor_id,
+            user_anchor_id=self._user_anchor_id or "(pending_user_anchor)",
             target_type=target_type,
             target_id=target_id,
             title=title,
@@ -440,6 +596,10 @@ class MusicAcquisitionEngine:
             claim_bridge=self._claims,
         )
 
+        if not result.get("ok") and not dry_run:
+            return self._pending_operation("confirm_like", target_id=target_id, title=title, target_type=target_type, evidence_refs=evidence_refs, memory_id=memory_id, note=note)
+        return result
+
     def reject_preference_signal(
         self,
         *,
@@ -449,15 +609,23 @@ class MusicAcquisitionEngine:
         dry_run: bool = False,
     ) -> dict:
         self._ensure_init()
+        self._require_purpose("music.data.create_memory")
         if not self._bank:
-            return {"ok": False, "error": "memory_bank_unavailable"}
-        return reject_preference(
+            if dry_run:
+                return {"ok": True, "dry_run": True, "submitted": False}
+            return self._pending_operation("reject_preference_signal", target_id=target_id, memory_id=memory_id, note=note)
+        result = reject_preference(
             self._bank,
             memory_id=memory_id,
             target_id=target_id,
             note=note,
             dry_run=dry_run,
         )
+
+
+        if not result.get("ok") and not dry_run:
+            return self._pending_operation("reject_preference_signal", target_id=target_id, memory_id=memory_id, note=note)
+        return result
 
     def unconfirm_like(
         self,
@@ -471,11 +639,14 @@ class MusicAcquisitionEngine:
     ) -> dict:
         """Explicit revoke of confirmed likes (does not touch NetEase saves)."""
         self._ensure_init()
+        self._require_purpose("music.data.create_memory")
         if not self._bank:
-            return {"ok": False, "error": "memory_bank_unavailable"}
-        if not self._user_anchor_id:
+            if dry_run:
+                return {"ok": True, "dry_run": True, "submitted": False}
+            return self._pending_operation("unconfirm_like", target_id=target_id, title=title, target_type=target_type, note=note, memory_id=memory_id)
+        if not self._user_anchor_id and not dry_run:
             self.ensure_user_anchor()
-        return unconfirm_preference(
+        result = unconfirm_preference(
             self._bank,
             user_anchor_id=self._user_anchor_id,
             target_type=target_type,
@@ -486,6 +657,10 @@ class MusicAcquisitionEngine:
             dry_run=dry_run,
             claim_bridge=self._claims,
         )
+
+        if not result.get("ok") and not dry_run:
+            return self._pending_operation("unconfirm_like", target_id=target_id, title=title, target_type=target_type, note=note, memory_id=memory_id)
+        return result
 
     def monitor_snapshot(self) -> dict:
         """Minimal ops snapshot for Monitor UI (sync-safe)."""
@@ -506,6 +681,7 @@ class MusicAcquisitionEngine:
                     loop = None
                 if loop and loop.is_running():
                     auth = {"status": "pending_async"}
+                    check.close()
                 else:
                     auth = asyncio.run(check).model_dump(mode="json")
             else:
@@ -529,6 +705,7 @@ class MusicAcquisitionEngine:
         return {
             "ok": True,
             "version": __version__,
+            "metrics": self.metrics(),
             "auth": auth,
             "user_anchor_id": self._user_anchor_id,
             "memory_bank": bank_health,
@@ -559,7 +736,8 @@ class MusicAcquisitionEngine:
         """
         self._ensure_init()
         owner = owner_user_id or self._owner_user_id
-        self._owner_user_id = owner
+        self._assert_owner(owner)
+        self._require_purpose("music.data.read")
         steps: dict = {}
 
         steps["domain"] = self.register_music_domain()
@@ -567,22 +745,9 @@ class MusicAcquisitionEngine:
 
         from music_acquisition.domain.models import AuthorizationRequest, MusicScopeConfig, SyncRequest
 
-        await self.configure_scopes(
-            MusicScopeConfig(
-                owner_user_id=owner,
-                scopes=[
-                    "music.library.liked_songs",
-                    "music.library.playlists",
-                    "music.library.playlist_tracks",
-                    "music.recommend.daily_songs",
-                    "music.history.playback",
-                    "music.library.favorite_artists",
-                ],
-            )
-        )
 
         if mode == "qr":
-            ch = await self.authorize(AuthorizationRequest(owner_user_id=owner, node_id=self._node_id))
+            ch = await self.authorize(AuthorizationRequest(owner_user_id=owner, node_id=self._node_id, mode="config_bind"))
             steps["auth_challenge"] = ch.model_dump(mode="json")
             import asyncio
 
@@ -595,7 +760,7 @@ class MusicAcquisitionEngine:
                 status = await self.get_authorization_status(ch.session_id)
             steps["auth"] = status.model_dump(mode="json")
         else:
-            ch = await self.authorize(AuthorizationRequest(owner_user_id=owner, node_id=self._node_id))
+            ch = await self.authorize(AuthorizationRequest(owner_user_id=owner, node_id=self._node_id, mode="config_bind"))
             if favorite_playlist_id:
                 bind = await self.complete_config_bind(
                     ch.session_id,
@@ -653,16 +818,166 @@ class MusicAcquisitionEngine:
         }
 
     def recall(self, *, subject_id: str, query: str = "") -> dict:
+        self._require_purpose("music.data.recall")
         snaps: list[MusicSnapshot] = []
         for dt in ("liked_songs", "daily_songs", "playlists"):
-            local_date = self._host.clock.now_iso()[:10] if dt == "daily_songs" else None
-            s = self._snapshots.load(dt, subject_id, local_date)
-            if s:
+            date = current_local_date(self._host.clock) if dt == "daily_songs" else None
+            s = self._snapshots.load(dt, subject_id, date)
+            if s and s.owner_user_id == self._owner_user_id:
                 snaps.append(s)
         return self._recall.recall_from_snapshots(snaps, query=query)
 
     def recall_mnemosyne(self, query: str) -> dict:
+        self._require_purpose("music.data.recall")
         return self._recall.recall_with_mnemosyne(query)
+
+    def _pending_operation(self, operation, **payload):
+        import hashlib, json
+        from pathlib import Path
+        from music_acquisition.util.file_lock import FileLock
+        oid = "op_" + hashlib.sha256(json.dumps([self._owner_user_id, operation, payload], sort_keys=True).encode()).hexdigest()[:24]
+        folder = Path(self._host.local_storage.root()) / "memory/operations"
+        with FileLock(folder / "_operations.lock"):
+            sequence = (self._host.local_storage.read_json("memory/operations/_sequence.json") or {}).get("value", 0) + 1
+            self._host.local_storage.write_json("memory/operations/_sequence.json", {"value": sequence})
+            target = payload.get("target_id") or payload.get("memory_id")
+            for path in folder.glob("op_*.json"):
+                old = self._host.local_storage.read_json(f"memory/operations/{path.name}") or {}
+                prior = old.get("payload") or {}
+                if target and old.get("status") == "pending" and target == (prior.get("target_id") or prior.get("memory_id")):
+                    old["status"] = "superseded"
+                    self._host.local_storage.write_json(f"memory/operations/{path.name}", old)
+            self._host.local_storage.write_json(f"memory/operations/{oid}.json", {"operation": operation,
+                "payload": payload, "owner_user_id": self._owner_user_id, "status": "pending", "sequence": sequence,
+                "created_at": self._host.clock.now_iso()})
+        return {"ok": False, "status": "pending", "operation_id": oid, "submitted": False}
+
+    def submit_operations(self):
+        self._require_purpose("music.data.create_memory")
+        from pathlib import Path
+        import json
+        results = []
+        if not self._bank:
+            return {"ok": False, "error": "mnemosyne_not_configured"}
+        for path in sorted((Path(self._host.local_storage.root()) / "memory" / "operations").glob("*.json")):
+            row = json.loads(path.read_text(encoding="utf-8"))
+            if row.get("status") != "pending" or row.get("owner_user_id") != self._owner_user_id:
+                continue
+            if row.get("operation") not in {"confirm_like", "unconfirm_like", "reject_preference_signal"}:
+                continue
+            result = getattr(self, row["operation"])(**row["payload"])
+            if result.get("ok"):
+                row["status"] = "submitted"
+                self._host.local_storage.write_json(f"memory/operations/{path.name}", row)
+            results.append({"operation_id": path.stem, "ok": bool(result.get("ok"))})
+        return {"ok": all(r["ok"] for r in results), "results": results}
+
+    def sync_history(self):
+        from pathlib import Path
+        import json
+        items = [json.loads(p.read_text(encoding="utf-8")) for p in (Path(self._host.local_storage.root()) / "sync" / "runs").glob("*.json")]
+        return {"items": sorted(items, key=lambda r: r.get("started_at", ""), reverse=True)[:100]}
+
+    def metrics(self):
+        from pathlib import Path
+        from collections import Counter
+        import json
+        root = Path(self._host.local_storage.root())
+        runs = self.sync_history()["items"]
+        counts = Counter()
+        for path in (root / "snapshots").rglob("*.json"):
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+            counts[snapshot.get("status", "unknown")] += 1
+        return {"sync_runs": len(runs), "sync_statuses": dict(Counter(r.get("status", "unknown") for r in runs)),
+            "retry_count": sum(r.get("retry_count", 0) for r in runs), "snapshots": dict(counts),
+            "pending_runs": len(list_pending_run_ids(self._host)), "outbox_pending": len(self._outbox.list_pending()),
+            "playback_capabilities": self._playback.capabilities(), "scheduler": self.scheduler_snapshot()}
+
+    def export_data(self):
+        self._require_purpose("music.data.export")
+        from pathlib import Path
+        import json
+        root = Path(self._host.local_storage.root())
+        snapshots = [json.loads(p.read_text(encoding="utf-8")) for p in (root / "snapshots").rglob("*.json")]
+        diffs = [json.loads(p.read_text(encoding="utf-8")) for p in (root / "diffs").glob("*.json")]
+        audit(self._host, "data_exported", owner=self._owner_user_id, count=len(snapshots))
+        return {"owner_user_id": self._owner_user_id, "snapshots": snapshots, "diffs": diffs, "credentials_included": False, "node_data_included": False}
+
+    def delete_data(self, *, target, confirm=False, object_id=""):
+        self._require_purpose("music.data.delete")
+        from pathlib import Path
+        import re
+        root = Path(self._host.local_storage.root()).resolve()
+        locations = {"snapshots": ["snapshots", "pages", "diffs"], "outbox": ["memory/outbox"], "pending_operations": ["memory/operations"]}
+        if target in {"node_memory", "node_evidence"}:
+            if not self._mnemosyne or not re.fullmatch(r"[A-Za-z0-9_-]+", object_id):
+                return {"ok": False, "error": "NODE_OBJECT_REQUIRED"}
+            endpoint = "memories" if target == "node_memory" else "evidences"
+            record = self._mnemosyne._request("GET", f"/api/v1/{endpoint}/{object_id}")
+            meta = record.get("metadata") or (record.get("evidence") or {}).get("metadata") or {}
+            if meta.get("domain") != "music":
+                return {"ok": False, "error": "MUSIC_OBJECT_REQUIRED"}
+            if not confirm:
+                return {"ok": True, "preview": True, "target": target, "object_id": object_id}
+            if target == "node_evidence":
+                # Node exposes retraction, not a promise of physical evidence erasure.
+                result = self._mnemosyne._request("POST", f"/api/v1/evidences/{object_id}/assessment", {"state": "revoked"})
+                return {**result, "physical_erasure": False, "operation": "revoke_evidence"}
+            return self._mnemosyne._request("DELETE", f"/api/v1/memories/{object_id}")
+        if target not in locations:
+            raise ValueError("unknown_delete_target")
+        files = []
+        for location in locations[target]:
+            for file in (root / location).rglob("*.json"):
+                resolved = file.resolve()
+                if root not in resolved.parents:
+                    raise ValueError("path_outside_data_root")
+                files.append(file)
+        if confirm:
+            # File-level deletion, constrained to the explicit acquisition subtree.
+            for file in files:
+                file.unlink()
+            audit(self._host, "data_deleted", owner=self._owner_user_id, target=target, count=len(files))
+        return {"ok": True, "preview": not confirm, "target": target, "count": len(files), "node_data_deleted": False}
+
+    def cleanup(self, *, retention_days=30, confirm=False):
+        self._require_purpose("music.data.delete")
+        from pathlib import Path
+        from datetime import timedelta
+        from music_acquisition.util.runtime import parse_time
+        import json
+        if not 1 <= retention_days <= 3650:
+            raise ValueError("invalid_retention_days")
+        root = Path(self._host.local_storage.root()).resolve()
+        consent = self._gate.consent(self._owner_user_id)
+        policies = self._host.local_storage.read_json("config/retention.json") or {}
+        policy = policies.get(consent.retention_policy_id, {"snapshot_days": 30, "outbox_days": 90, "audit_days": 180})
+        files = []
+        for tree in ("snapshots", "pages", "diffs", "memory/outbox", "audit"):
+            category = "outbox_days" if tree == "memory/outbox" else "audit_days" if tree == "audit" else "snapshot_days"
+            cutoff = parse_time(self._host.clock.now_iso()) - timedelta(days=min(retention_days, policy.get(category, 30)))
+            for path in (root / tree).rglob("*.json"):
+                if root not in path.resolve().parents:
+                    raise ValueError("path_outside_data_root")
+                record = json.loads(path.read_text(encoding="utf-8"))
+                at = record.get("fetched_at") or record.get("generated_at") or record.get("created_at") or record.get("at")
+                if at and parse_time(at) < cutoff:
+                    files.append(path)
+        if confirm:
+            for path in files:
+                path.unlink()
+            audit(self._host, "retention_cleanup", owner=self._owner_user_id, count=len(files), retention_days=retention_days)
+        return {"ok": True, "preview": not confirm, "count": len(files), "node_data_deleted": False}
+
+    def set_retention_policy(self, name, policy):
+        fields = {"snapshot_days", "outbox_days", "audit_days"}
+        if not name or set(policy) != fields or any(type(v) is not int or not 1 <= v <= 3650 for v in policy.values()):
+            raise ValueError("invalid_retention_policy")
+        policies = self._host.local_storage.read_json("config/retention.json") or {}
+        policies[name] = policy
+        self._host.local_storage.write_json("config/retention.json", policies)
+        audit(self._host, "retention_policy_changed", owner=self._owner_user_id, policy_id=name)
+        return {"ok": True, "policy_id": name, **policy}
 
     @property
     def playback(self) -> MusicPlaybackService:
@@ -690,6 +1005,8 @@ class MusicAcquisitionEngine:
 
     def sync_playlist_scopes_from_client(self) -> dict:
         """从桌宠 CDP/进程表灌入 Bank，并可选回灌进程表。"""
+        self._require_purpose("music.data.read")
+        self._require_purpose("music.data.cache")
         ingested = self._scope_store.ingest_from_murasame_registry()
         # 若桌宠不可用，仍返回 Bank 快照
         return {
@@ -701,6 +1018,7 @@ class MusicAcquisitionEngine:
         }
 
     def hydrate_playlist_scopes_to_client(self) -> dict:
+        self._require_purpose("music.data.export")
         return self._scope_store.hydrate_murasame_registry()
 
     def enable_auto_sync(
@@ -718,6 +1036,12 @@ class MusicAcquisitionEngine:
         handle; cancel with ``disable_auto_sync``.
         """
         self._ensure_init()
+        if interval_sec < 1:
+            raise ValueError("invalid_schedule_interval")
+        self._require_purpose("music.data.read")
+        self._require_purpose("music.data.cache")
+        if submit:
+            self._require_purpose("music.data.submit_evidence")
         sched = self._host.task_scheduler
         every = getattr(sched, "schedule_every", None)
         cols = collectors or [
@@ -735,8 +1059,9 @@ class MusicAcquisitionEngine:
 
             async def _run() -> None:
                 try:
+                    await self.recover_startup(self._owner_user_id)
                     await self.sync_now(
-                        SyncRequest(owner_user_id=self._owner_user_id, collectors=cols)
+                        SyncRequest(owner_user_id=self._owner_user_id, collectors=cols, trigger="scheduled")
                     )
                     if submit:
                         self.submit_evidence_outbox(
@@ -767,6 +1092,7 @@ class MusicAcquisitionEngine:
             handle = sched.schedule("music_auto_sync", float(initial_delay_sec), _job)
         self._auto_sync_handle = str(handle)
         meta = {
+            "enabled": True,
             "handle": self._auto_sync_handle,
             "interval_sec": interval_sec,
             "collectors": cols,
@@ -796,7 +1122,8 @@ class MusicAcquisitionEngine:
 
     async def shutdown(self) -> None:
         try:
-            self.disable_auto_sync()
+            self._host.task_scheduler.cancel(self._auto_sync_handle or "music_auto_sync")
+            self._auto_sync_handle = ""
         except Exception:
             pass
         host_shutdown = getattr(self._host, "shutdown", None)

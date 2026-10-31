@@ -22,12 +22,30 @@ class MusicPlaybackService:
         scope_store: "PlaylistScopeStore | None" = None,
         verify_timeout_sec: float = 4.0,
         verify_poll_sec: float = 0.4,
+        authorize=None,
+        snapshot_resolver=None,
     ) -> None:
         self._bridge = enable_murasaame_bridge
         self._scope_store = scope_store
         self._last: dict[str, Any] = {}
         self._verify_timeout_sec = float(verify_timeout_sec)
         self._verify_poll_sec = float(verify_poll_sec)
+        self._authorize = authorize
+        self._resolve_snapshot = snapshot_resolver
+        self._active_scope = None
+
+    def _play_resolved(self, kind, **target):
+        resolved = self._resolve_snapshot(kind, **target)
+        if not resolved.get("ok"):
+            return resolved
+        result = self.play_song(resolved["track_id"])
+        result["target"] = resolved
+        if result.get("ok"):
+            self._active_scope = resolved["scope"]
+        return result
+
+    def _allowed(self):
+        return self._authorize is None or self._authorize()
 
     def capabilities(self) -> dict[str, bool]:
         ok = False
@@ -84,7 +102,7 @@ class MusicPlaybackService:
                 except Exception:
                     info = {}
                 last = {"playing": playing, "track_id": cur, "info": info, "port": port}
-                if playing and (not expect or cur == expect or expect in cur):
+                if playing and expect and cur.replace("netease:", "").strip() == expect:
                     return {"ok": True, "verified": True, **last}
                 time.sleep(self._verify_poll_sec)
             return {
@@ -99,18 +117,25 @@ class MusicPlaybackService:
     def play_song(self, track_id: str, *, verify: bool = True) -> dict[str, Any]:
         if not self.capabilities().get("playSong"):
             return {"ok": False, "error": "PLAYBACK_UNSUPPORTED"}
+        if not self._allowed():
+            return {"ok": False, "error": "PLAYBACK_PERMISSION_DENIED"}
         try:
             from Murasame import netease_music as NM  # type: ignore
 
             sid = int(str(track_id).replace("netease:", ""))
             result = NM.launch_cloudmusic_song(sid)
-            out: dict[str, Any] = {"ok": True, "result": result, "track_id": str(sid)}
+            launched = bool(result.get("ok")) if isinstance(result, dict) else bool(result)
+            if not launched:
+                return {"ok": False, "error": "PLAY_FAILED"}
+            out: dict[str, Any] = {"ok": False, "command_sent": True, "track_id": str(sid), "error": "PLAY_VERIFY_UNAVAILABLE"}
             if verify and self.capabilities().get("verifyPlayback"):
                 v = self._verify_playing(str(sid))
                 out["verify"] = v
                 out["ok"] = bool(v.get("verified"))
                 if not out["ok"]:
                     out["error"] = v.get("error") or "PLAY_NOT_VERIFIED"
+                else:
+                    out.pop("error", None)
             self._last = out
             return out
         except Exception as exc:  # noqa: BLE001
@@ -123,6 +148,10 @@ class MusicPlaybackService:
             return {"ok": False, "error": "AMBIGUOUS_TARGET"}
         if not self.capabilities().get("playPlaylist"):
             return {"ok": False, "error": "PLAYBACK_UNSUPPORTED"}
+        if not self._allowed():
+            return {"ok": False, "error": "PLAYBACK_PERMISSION_DENIED"}
+        if self._resolve_snapshot:
+            return self._play_resolved("playlist", playlist_id=playlist_id, track_id=track_id, index=index)
         try:
             from Murasame import netease_music as NM  # type: ignore
 
@@ -134,12 +163,12 @@ class MusicPlaybackService:
             if track_id is not None:
                 return self.play_song(track_id)
             result = NM.play_playlist_id(pid)
-            out: dict[str, Any] = {"ok": True, "playlist": pid, "result": result}
+            out: dict[str, Any] = {"ok": False, "playlist": pid, "command_sent": bool(result), "error": "PLAY_TARGET_UNRESOLVED"}
             if self.capabilities().get("verifyPlayback"):
                 v = self._verify_playing(None)
                 out["verify"] = v
                 # playlist open may not immediately report track — soft verify
-                out["ok"] = bool(result) if not v.get("verified") else True
+                out["ok"] = False  # opening a playlist is not proof of its actual track
             self._last = out
             return out
         except Exception as exc:  # noqa: BLE001
@@ -152,6 +181,10 @@ class MusicPlaybackService:
             return {"ok": False, "error": "AMBIGUOUS_TARGET"}
         if not self.capabilities().get("playDaily"):
             return {"ok": False, "error": "PLAYBACK_UNSUPPORTED"}
+        if not self._allowed():
+            return {"ok": False, "error": "PLAYBACK_PERMISSION_DENIED"}
+        if self._resolve_snapshot:
+            return self._play_resolved("daily", date=date, track_id=track_id, index=index)
         try:
             if index is not None and self._scope_store is not None:
                 hit = self._scope_store.lookup_index("source:daily_recommend", int(index))
@@ -166,7 +199,7 @@ class MusicPlaybackService:
 
             result = NM.open_daily_recommend_page()
             self._last = {"date": date, "result": result}
-            return {"ok": True, "result": result, "note": "opens_daily_page"}
+            return {"ok": False, "command_sent": bool(result), "error": "PLAY_TARGET_UNRESOLVED", "note": "opens_daily_page"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": "PLAY_FAILED", "detail": str(exc)}
 
@@ -174,6 +207,22 @@ class MusicPlaybackService:
         """下一首/上一首：锚定源歌单（桌宠 CDP + Bank 边界）。"""
         if not self.capabilities().get("playNextInScope"):
             return {"ok": False, "error": "PLAYBACK_UNSUPPORTED"}
+        if not self._allowed():
+            return {"ok": False, "error": "PLAYBACK_PERMISSION_DENIED"}
+        if self._resolve_snapshot:
+            if not self._active_scope:
+                return {"ok": False, "error": "PLAY_SOURCE_UNKNOWN"}
+            try:
+                from Murasame.netease_music import _try_cdp_ready
+                from Murasame.netease_cdp import cdp_current_track_id
+                from Murasame.utils import get_config
+                ready, port = _try_cdp_ready(get_config())
+                if not ready:
+                    return {"ok": False, "error": "CDP_NOT_READY"}
+                current = str(cdp_current_track_id(port=port) or "")
+                return self._play_resolved(self._active_scope["kind"], **{k: v for k, v in self._active_scope.items() if k != "kind"}, current_track_id=current, delta=delta)
+            except Exception:
+                return {"ok": False, "error": "PLAY_TARGET_UNRESOLVED"}
         try:
             from Murasame import netease_music as NM  # type: ignore
             from Murasame.utils import get_config  # type: ignore
@@ -189,7 +238,10 @@ class MusicPlaybackService:
             if out["ok"] and self.capabilities().get("verifyPlayback"):
                 v = self._verify_playing(None)
                 out["verify"] = v
-                out["ok"] = bool(v.get("verified") or result.get("ok"))
+                out["ok"] = False
+            out["command_sent"] = bool(result.get("ok"))
+            out["ok"] = False
+            out["error"] = "PLAY_TARGET_UNRESOLVED"
             self._last = out
             return out
         except Exception as exc:  # noqa: BLE001
@@ -205,6 +257,8 @@ class MusicPlaybackService:
         prefer_client: bool = True,
     ) -> dict[str, Any]:
         """往返查找：优先客户端 CDP 同步，否则读 Memory Bank。"""
+        if not self._allowed():
+            return {"ok": False, "error": "PLAYBACK_PERMISSION_DENIED"}
         if prefer_client:
             try:
                 from Murasame.netease_cdp import cdp_roundtrip_lookup  # type: ignore

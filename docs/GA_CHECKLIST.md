@@ -1,8 +1,8 @@
 # Mnemosyne Music Acquisition — GA / Hardening Checklist
 
 **组件版本：** 0.5.0  
-**日期：** 2026-10-31  
-**总体：** **Beta+**（P0/P1 闭合；仍非「全平台 GA」）
+**日期：** 2026-11-01
+**总体：** **Beta+**（P0/P1 闭合；代码/离线验收通过；真实网易云待实机）
 
 ## 必须绿
 
@@ -55,3 +55,16 @@ py -3 -m music_acquisition.cli doctor
 py -3 -m music_acquisition.cli bootstrap --playlist-id <红心歌单ID>
 py -3 -m music_acquisition.cli confirm-like --target-id <曲目ID> --dry-run
 ```
+
+最终离线验收：
+
+```text
+py -3 -m pytest tests -q     62 passed, 2 skipped
+node --test test_bridge.cjs  2 passed
+PyInstaller                  6.22.3
+standalone doctor            exit=0（PATH 无 Python）
+```
+
+详见 [FINAL_ACCEPTANCE_2026_11_01.md](FINAL_ACCEPTANCE_2026_11_01.md)。
+
+真实网易云扫码、接口写操作和客户端播放仍需实机验证；不得把 Mock / 临时 Bank 结果当作真实账号验收。

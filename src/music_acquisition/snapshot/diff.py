@@ -5,11 +5,13 @@ import secrets
 from typing import Any
 
 from music_acquisition.domain.models import MusicDiff, MusicDiffItem
+from music_acquisition.snapshot.hashing import content_record
 
 
 def _track_id(rec: Any) -> str:
     if isinstance(rec, dict):
-        return str(rec.get("provider_track_id") or rec.get("track_id") or "")
+        prefix = f"playlist:{rec['parent_playlist_id']}/track:" if rec.get("parent_playlist_id") else ""
+        return prefix + str(rec.get("provider_track_id") or rec.get("track_id") or rec.get("provider_playlist_id") or rec.get("playlist_id") or rec.get("provider_artist_id") or rec.get("artist_id") or "")
     return str(getattr(rec, "provider_track_id", None) or getattr(rec, "track_id", "") or "")
 
 
@@ -41,6 +43,15 @@ def compute_track_diff(
                 detail={"tombstone": True, "reason": "removed_from_source"},
             )
         )
+    previous = {_track_id(r): r for r in previous_records if _track_id(r)}
+    current = {_track_id(r): r for r in current_records if _track_id(r)}
+    for tid in sorted(prev_ids & curr_ids):
+        if content_record(previous[tid]) != content_record(current[tid]):
+            renamed = data_type == "playlists" and previous[tid].get("name") != current[tid].get("name")
+            changes.append(MusicDiffItem(change_type="playlist_renamed" if renamed else "metadata_changed", provider_entity_id=tid))
+    old_order, new_order = list(previous), list(current)
+    if prev_ids == curr_ids and old_order != new_order:
+        changes.append(MusicDiffItem(change_type="order_changed", detail={"previous_order": old_order, "current_order": new_order}))
     return MusicDiff(
         diff_id=f"diff_{secrets.token_hex(8)}",
         subject_id=subject_id,

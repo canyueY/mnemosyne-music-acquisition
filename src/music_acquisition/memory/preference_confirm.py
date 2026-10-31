@@ -12,6 +12,10 @@ from typing import Any
 from music_acquisition.memory.bank_backend import MemoryBankBackend
 
 
+def _accepted(response):
+    return bool(response) and response.get("ok") is not False and not response.get("error")
+
+
 def confirm_preference(
     bank: MemoryBankBackend,
     *,
@@ -89,12 +93,22 @@ def confirm_preference(
         )
         mid = memory_id
         mem_resp = updated
+        if not _accepted(updated):
+            return {"ok": False, "error": "update_failed", "response": updated}
     else:
         mem_resp = bank.propose_memory(mem_payload)
         mid = str(mem_resp.get("id") or (mem_resp.get("memory") or {}).get("id") or "")
         if not mid:
             return {"ok": False, "error": "propose_failed", "response": mem_resp}
 
+    if mem_resp.get("status") != "active" or (mem_resp.get("metadata") or {}).get("status") != "confirmed":
+        mem_resp = bank.update_memory(mid, {"status": "active", "content": content, "confidence": .92, "metadata": mem_payload["metadata"]})
+        if not _accepted(mem_resp):
+            return {"ok": False, "error": "update_failed", "response": mem_resp}
+    listed = bank.list_relations(mid)
+    if not _accepted(listed):
+        return {"ok": False, "error": "relation_lookup_failed", "response": listed}
+    exists = any(r.get("from_id") == anchor and r.get("to_id") == mid and r.get("relation") == "likes" for r in listed.get("items", []))
     rel_payload = {
         "from_id": anchor,
         "to_id": mid,
@@ -103,8 +117,8 @@ def confirm_preference(
         "confidence": 0.92,
         "metadata": plan["relation"]["metadata"],
     }
-    rel_resp = bank.link_relation(rel_payload)
-    fb_resp = bank.feedback(
+    rel_resp = {"ok": True, "reused": True} if exists else bank.link_relation(rel_payload)
+    fb_resp = {"ok": True, "skipped": "already_confirmed"} if exists else bank.feedback(
         {
             "memory_id": mid,
             "useful": True,
@@ -126,7 +140,7 @@ def confirm_preference(
         except Exception as exc:  # noqa: BLE001
             claim_resp = {"ok": False, "error": str(exc)}
     audit = {
-        "ok": True,
+        "ok": _accepted(mem_resp) and _accepted(rel_resp) and _accepted(fb_resp) and (claim_resp is None or _accepted(claim_resp)),
         "dry_run": False,
         "memory_id": mid,
         "memory": mem_resp,
@@ -201,7 +215,7 @@ def reject_preference(
             "producer": "music_acquisition.preference_confirm",
         }
     )
-    return {"ok": True, "memory_id": mid, "update": updated, "feedback": fb, "likes_written": False}
+    return {"ok": _accepted(updated) and _accepted(fb), "memory_id": mid, "update": updated, "feedback": fb, "likes_written": False}
 
 
 def unconfirm_preference(
@@ -333,7 +347,7 @@ def unconfirm_preference(
         except Exception as exc:  # noqa: BLE001
             claim_resp = {"ok": False, "error": str(exc)}
     audit = {
-        "ok": True,
+        "ok": _accepted(updated) and _accepted(rev) and _accepted(fb) and (claim_resp is None or _accepted(claim_resp)),
         "dry_run": False,
         "memory_id": mid,
         "target_id": tid,

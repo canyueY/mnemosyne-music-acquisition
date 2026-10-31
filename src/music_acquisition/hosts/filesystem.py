@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from music_acquisition.hosts.scheduler import ThreadingScheduler
 from music_acquisition.security.credential_crypto import CredentialCrypto, is_encrypted_blob
+from music_acquisition.util.runtime import atomic_write, under
 
 
 class FileCredentialStore:
@@ -26,7 +27,7 @@ class FileCredentialStore:
 
     async def save(self, key: str, value: bytes) -> None:
         sealed = self._crypto.seal(value)
-        self._path(key).write_bytes(sealed)
+        atomic_write(self._path(key), sealed)
 
     async def load(self, key: str) -> bytes | None:
         p = self._path(key)
@@ -63,15 +64,15 @@ class FileLocalStorage:
         return str(self._root)
 
     def path(self, *parts: str) -> str:
-        p = self._root.joinpath(*parts)
+        p = under(self._root, *parts)
         p.parent.mkdir(parents=True, exist_ok=True)
         return str(p)
 
     def write_bytes(self, rel: str, data: bytes) -> None:
-        Path(self.path(rel)).write_bytes(data)
+        atomic_write(self.path(rel), data)
 
     def read_bytes(self, rel: str) -> bytes | None:
-        p = self._root / rel
+        p = under(self._root, rel)
         return p.read_bytes() if p.is_file() else None
 
     def write_json(self, rel: str, obj: Any) -> None:

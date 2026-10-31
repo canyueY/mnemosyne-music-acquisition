@@ -8,6 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
+from music_acquisition.source.http_error import SourceHttpError
 
 PLAYLIST_DETAIL = "https://music.163.com/api/v6/playlist/detail"
 SONG_DETAIL = "https://music.163.com/api/v3/song/detail"
@@ -23,17 +24,20 @@ _HEADERS = {
 }
 
 
-def _get_json(url: str, params: dict[str, str] | None = None, timeout: float = 25.0) -> Any:
+def _get_json(url: str, params: dict[str, str] | None = None, timeout: float = 25.0, *, cookie="") -> Any:
     q = urllib.parse.urlencode(params or {})
     full = f"{url}?{q}" if q else url
-    req = urllib.request.Request(full, headers=_HEADERS)
+    req = urllib.request.Request(full, headers={k: v for k, v in _HEADERS.items() if k != "Cookie"})
+    req.add_unredirected_header("Cookie", cookie or _HEADERS["Cookie"])
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"http_{exc.code}:{url}") from exc
+        if exc.code in {401, 403}:
+            raise PermissionError("LOGIN_REQUIRED") from exc
+        raise SourceHttpError(exc.code, exc.headers.get("Retry-After") if exc.headers else None) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"network:{exc.reason}") from exc
+        raise ConnectionError("NETWORK_ERROR") from exc
 
 
 def parse_track(raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -74,6 +78,7 @@ def parse_track(raw: dict[str, Any]) -> dict[str, Any] | None:
         "album": album,
         "duration_ms": duration_ms,
         "metadata": {"source": "netease_web", "schema_version": "music.canonical.v1"},
+        "extensions": raw,
     }
 
 
@@ -92,12 +97,12 @@ def extract_track_ids(playlist: dict[str, Any]) -> list[int]:
     return out
 
 
-def fetch_songs_by_ids(song_ids: list[int]) -> list[dict[str, Any]]:
+def fetch_songs_by_ids(song_ids: list[int], *, cookie="") -> list[dict[str, Any]]:
     ids = [int(x) for x in song_ids if int(x) > 0]
     if not ids:
         return []
     payload = json.dumps([{"id": sid} for sid in ids], separators=(",", ":"))
-    data = _get_json(SONG_DETAIL, {"c": payload})
+    data = _get_json(SONG_DETAIL, {"c": payload}, cookie=cookie)
     songs = (data.get("songs") or []) if isinstance(data, dict) else []
     out: list[dict[str, Any]] = []
     for raw in songs:
@@ -108,15 +113,15 @@ def fetch_songs_by_ids(song_ids: list[int]) -> list[dict[str, Any]]:
     return out
 
 
-def fetch_playlist_tracks(playlist_id: int, *, limit: int = 500) -> tuple[list[dict[str, Any]], int, bool]:
+def fetch_playlist_tracks(playlist_id: int, *, limit: int | None = None, cookie="", page_cache=None) -> tuple[list[dict[str, Any]], int, bool]:
     """Returns (tracks, expected_count, complete)."""
     pid = int(playlist_id)
-    lim = max(1, min(int(limit), 5000))
-    data = _get_json(PLAYLIST_DETAIL, {"id": str(pid), "n": str(lim)})
+    lim = max(1, int(limit)) if limit is not None else 1000000
+    data = _get_json(PLAYLIST_DETAIL, {"id": str(pid), "n": str(min(lim, 500))}, cookie=cookie)
     playlist = data.get("playlist") if isinstance(data, dict) else None
     if not isinstance(playlist, dict):
         raise RuntimeError(f"playlist_unavailable:{pid}")
-    expected = int(playlist.get("trackCount") or 0) or None
+    expected = int(playlist["trackCount"]) if playlist.get("trackCount") is not None else None
     tracks_raw = playlist.get("tracks") or []
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -137,7 +142,36 @@ def fetch_playlist_tracks(playlist_id: int, *, limit: int = 500) -> tuple[list[d
         for i in range(0, len(need), 200):
             batch = need[i : i + 200]
             try:
-                fetched = fetch_songs_by_ids(batch)
+                import hashlib
+                key = hashlib.sha256(json.dumps([pid, batch, playlist.get("updateTime")]).encode()).hexdigest()
+                import time
+                cached = page_cache.read_json(f"pages/{key}.json") if page_cache else None
+                fetched = cached.get("records") if isinstance(cached, dict) and time.time() - cached.get("cached_epoch", 0) < 86400 else None
+                if fetched is None:
+                    for attempt in range(3):
+                        try:
+                            fetched = fetch_songs_by_ids(batch, cookie=cookie)
+                            break
+                        except PermissionError:
+                            raise
+                        except (OSError, RuntimeError) as exc:
+                            if isinstance(exc, SourceHttpError) and exc.retry_after:
+                                raise
+                            if attempt == 2:
+                                raise
+                            from music_acquisition.sync.retry import should_retry, backoff_delay
+                            if not isinstance(exc, OSError) and not should_retry(str(exc)):
+                                raise
+                            time.sleep(backoff_delay(attempt, base=.1, max_delay=2))
+                    if page_cache and {str(x["provider_track_id"]) for x in fetched} == {str(x) for x in batch}:
+                        from datetime import datetime, timezone
+                        page_cache.write_json(f"pages/{key}.json", {"records": fetched, "cached_epoch": time.time(), "at": datetime.now(timezone.utc).isoformat()})
+            except PermissionError:
+                raise
+            except SourceHttpError:
+                raise
+            except (ConnectionError, TimeoutError):
+                raise
             except Exception:
                 partial_fail = True
                 continue
@@ -150,12 +184,14 @@ def fetch_playlist_tracks(playlist_id: int, *, limit: int = 500) -> tuple[list[d
                     break
             if len(out) >= lim:
                 break
-        if expected and len(out) < min(expected, lim):
+        if expected is not None and len(out) != expected:
             partial_fail = True
-        complete = not partial_fail and (expected is None or len(out) >= min(expected, lim))
+        complete = not partial_fail and expected is not None and len(out) == expected
     else:
-        complete = expected is None or len(out) >= min(expected, lim)
-    return out[:lim], int(expected or len(out)), complete
+        complete = expected is not None and len(out) == expected
+    order = {str(tid): i for i, tid in enumerate(extract_track_ids(playlist))}
+    out.sort(key=lambda row: order.get(row["provider_track_id"], len(order)))
+    return out[:lim], int(expected if expected is not None else len(out)), complete
 
 
 def fetch_daily_songs(*, limit: int = 30) -> list[dict[str, Any]]:

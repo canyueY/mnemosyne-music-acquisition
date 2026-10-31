@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """REST /api/music/v1 — Dual-Mode HTTP surface (optional fastapi extra)."""
 
-from __future__ import annotations
-
 from typing import Any
+import os
+import secrets
+from music_acquisition.domain.models import MusicConsent
 
 from music_acquisition.domain.models import (
     AuthorizationRequest,
@@ -13,18 +14,55 @@ from music_acquisition.domain.models import (
 from music_acquisition.engine.music_acquisition_engine import MusicAcquisitionEngine
 
 
-def create_app(engine: MusicAcquisitionEngine):
+def create_app(engine: MusicAcquisitionEngine, *, access_token: str | None = None, agent_token: str | None = None):
     try:
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, Request, Depends, Header
         from pydantic import BaseModel
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("install extras: pip install 'mnemosyne-music-acquisition[http]'") from exc
 
-    app = FastAPI(title="Mnemosyne Music Acquisition", version="0.3.0")
+    from fastapi.responses import JSONResponse
+    token = access_token or os.environ.get("MNEMOSYNE_MUSIC_API_TOKEN", "")
+    business_token = agent_token or os.environ.get("MNEMOSYNE_MUSIC_AGENT_TOKEN", "")
+    if token and business_token and secrets.compare_digest(token, business_token):
+        raise ValueError("owner_and_agent_tokens_must_differ")
+    async def authenticated(request: Request):
+        if not request.url.path.startswith("/api/"):
+            return
+        supplied = request.headers.get("authorization", "")
+        if supplied.startswith("Bearer "):
+            value = supplied[7:]
+            if token and secrets.compare_digest(value, token):
+                return
+            if business_token and secrets.compare_digest(value, business_token):
+                allowed_get = {"health", "capabilities", "snapshots", "sync/status", "playlist/scopes"}
+                suffix = request.url.path.removeprefix("/api/music/v1/")
+                if (request.method == "GET" and suffix in allowed_get) or (request.method == "POST" and (suffix == "acquisition/sync" or suffix in {"playback/song", "playback/playlist", "playback/daily", "playback/next", "recall", "playlist/roundtrip"})):
+                    return
+                raise HTTPException(status_code=403, detail="owner_action_required")
+        raise HTTPException(status_code=401, detail="authentication_required")
+    from contextlib import asynccontextmanager
+    @asynccontextmanager
+    async def lifespan(app):
+        if not engine._initialized:
+            await engine.initialize()
+        await engine.recover_startup(engine._owner_user_id)
+        yield
+        await engine.shutdown()
+    app = FastAPI(title="Mnemosyne Music Acquisition", version="0.5.0", dependencies=[Depends(authenticated)], lifespan=lifespan)
+
+    @app.exception_handler(PermissionError)
+    async def denied(request, exc):
+        return JSONResponse(status_code=403, content={"detail": "permission_denied"})
+
+    @app.exception_handler(ValueError)
+    async def invalid(request, exc):
+        return JSONResponse(status_code=400, content={"detail": "invalid_request"})
 
     class BindBody(BaseModel):
         favorite_playlist_id: str
         subject_id: str | None = None
+        state_nonce: str
 
     class ScopeBody(BaseModel):
         owner_user_id: str
@@ -35,6 +73,17 @@ def create_app(engine: MusicAcquisitionEngine):
         owner_user_id: str
         collectors: list[str] = []
         trigger: str = "manual"
+        playlist_ids: list[str] = []
+        force_refresh: bool = False
+
+    class RetentionBody(BaseModel):
+        snapshot_days: int = 30
+        outbox_days: int = 90
+        audit_days: int = 180
+
+    @app.put("/api/music/v1/admin/retention/{name}")
+    async def retention_policy(name: str, body: RetentionBody):
+        return engine.set_retention_policy(name, body.model_dump())
 
     @app.get("/api/music/v1/health")
     async def health() -> dict[str, Any]:
@@ -54,8 +103,8 @@ def create_app(engine: MusicAcquisitionEngine):
         return ch.model_dump(mode="json")
 
     @app.get("/api/music/v1/auth/sessions/{session_id}")
-    async def auth_status(session_id: str) -> dict[str, Any]:
-        st = await engine.get_authorization_status(session_id)
+    async def auth_status(session_id: str, state_nonce: str = Header(alias="X-Music-Session-Nonce")) -> dict[str, Any]:
+        st = await engine.get_authorization_status(session_id, state_nonce=state_nonce)
         return st.model_dump(mode="json")
 
     @app.post("/api/music/v1/auth/sessions/{session_id}/config-bind")
@@ -64,8 +113,22 @@ def create_app(engine: MusicAcquisitionEngine):
             session_id,
             favorite_playlist_id=body.favorite_playlist_id,
             subject_id=body.subject_id,
+            state_nonce=body.state_nonce,
         )
         return st.model_dump(mode="json")
+
+    @app.post("/api/music/v1/auth/sessions/{session_id}/cancel")
+    async def auth_cancel(session_id: str, state_nonce: str = Header(alias="X-Music-Session-Nonce")):
+        return engine._auth.cancel(session_id, state_nonce)
+
+    @app.post("/api/music/v1/consent")
+    async def consent(body: MusicConsent):
+        return await engine.set_consent(body)
+
+    @app.get("/api/music/v1/scopes")
+    async def scopes_get():
+        consent = engine._gate.consent(engine._owner_user_id)
+        return {"scopes": engine._gate.get_scopes(engine._owner_user_id), "consent": consent.model_dump(mode="json") if consent else None}
 
     @app.post("/api/music/v1/auth/revoke")
     async def auth_revoke(subject_id: str) -> dict[str, Any]:
@@ -90,6 +153,8 @@ def create_app(engine: MusicAcquisitionEngine):
                 owner_user_id=body.owner_user_id,
                 collectors=body.collectors,
                 trigger=body.trigger,  # type: ignore[arg-type]
+                playlist_ids=body.playlist_ids,
+                force_refresh=body.force_refresh,
             )
         )
         return run.model_dump(mode="json")
@@ -97,6 +162,15 @@ def create_app(engine: MusicAcquisitionEngine):
     @app.get("/api/music/v1/sync/runs/{run_id}")
     async def sync_run(run_id: str) -> dict[str, Any]:
         return (await engine.get_sync_status(run_id)).model_dump(mode="json")
+
+    @app.get("/api/music/v1/sync/status")
+    async def sync_status(run_id: str | None = None):
+        return (await engine.get_sync_status(run_id)).model_dump(mode="json")
+
+    @app.get("/api/music/v1/admin/context")
+    async def context():
+        return {"owner_user_id": engine._owner_user_id, "node_id": engine._node_id,
+            "scopes": engine._gate.get_scopes(engine._owner_user_id)}
 
     @app.get("/api/music/v1/snapshots")
     async def snapshots(data_type: str, subject_id: str, local_date: str | None = None) -> dict[str, Any]:
@@ -194,7 +268,10 @@ def create_app(engine: MusicAcquisitionEngine):
 
     @app.get("/api/music/v1/monitor/snapshot")
     async def monitor_snapshot() -> dict[str, Any]:
-        return engine.monitor_snapshot()
+        import asyncio
+        payload = await asyncio.to_thread(engine.monitor_snapshot)
+        payload["auth"] = (await engine.get_authorization_status()).model_dump(mode="json")
+        return payload
 
     @app.get("/monitor/")
     @app.get("/monitor")
@@ -202,7 +279,7 @@ def create_app(engine: MusicAcquisitionEngine):
         from fastapi.responses import HTMLResponse
         from pathlib import Path
 
-        path = Path(__file__).resolve().parents[3] / "monitor" / "index.html"
+        path = Path(__file__).resolve().parents[1] / "resources" / "monitor.html"
         if not path.is_file():
             raise HTTPException(status_code=404, detail="monitor_ui_missing")
         return HTMLResponse(path.read_text(encoding="utf-8"))
@@ -263,6 +340,7 @@ def create_app(engine: MusicAcquisitionEngine):
 
     @app.get("/api/music/v1/playlist/scopes")
     async def playlist_scopes() -> dict[str, Any]:
+        engine._require_purpose("music.data.read")
         return engine.playlist_scopes.snapshot()
 
     @app.post("/api/music/v1/playlist/scopes/sync")
@@ -278,9 +356,56 @@ def create_app(engine: MusicAcquisitionEngine):
         from music_acquisition.observability import engine_health_payload
 
         auth = await engine.get_authorization_status()
-        payload = engine_health_payload(ok=True, auth_status=auth.status)
+        payload = {"engine": engine._initialized, "authorization": auth.status, "metrics": engine.metrics()}
         payload["playlist_scopes"] = engine.playlist_scopes.snapshot()
         payload["data_root"] = engine._host.local_storage.root()
         return payload
+
+    @app.get("/api/music/v1/sync/runs")
+    async def sync_history():
+        return engine.sync_history()
+
+    @app.post("/api/music/v1/sync/recover")
+    async def recover():
+        return {"runs": [r.model_dump(mode="json") for r in await engine.recover_startup(engine._owner_user_id)]}
+
+    @app.post("/api/music/v1/admin/cleanup")
+    async def cleanup(retention_days: int = 30, confirm: bool = False):
+        return engine.cleanup(retention_days=retention_days, confirm=confirm)
+
+    @app.get("/api/music/v1/capabilities")
+    async def capabilities():
+        return (await engine.source.get_capabilities()).model_dump(mode="json")
+
+    @app.post("/api/music/v1/admin/submit-operations")
+    async def submit_operations():
+        return engine.submit_operations()
+
+    @app.post("/api/music/v1/admin/schedule")
+    async def schedule(enabled: bool, interval_sec: float = 86400):
+        return engine.enable_auto_sync(interval_sec=interval_sec) if enabled else engine.disable_auto_sync()
+
+    @app.get("/api/music/v1/admin/export")
+    async def export():
+        return engine.export_data()
+
+    @app.post("/api/music/v1/admin/delete")
+    async def delete(target: str, confirm: bool = False, object_id: str = ""):
+        return engine.delete_data(target=target, confirm=confirm, object_id=object_id)
+
+    @app.get("/api/music/v1/diff")
+    async def diffs():
+        engine._require_purpose("music.data.read")
+        from pathlib import Path
+        import json
+        return {"items": [json.loads(p.read_text(encoding="utf-8")) for p in sorted((Path(engine._host.local_storage.root()) / "diffs").glob("*.json"))[-100:]]}
+
+    @app.post("/api/music/v1/playback/playlist")
+    async def playback_playlist(playlist_id: str, track_id: str | None = None, index: int | None = None):
+        return engine.playback.play_playlist(playlist_id, track_id=track_id, index=index)
+
+    @app.post("/api/music/v1/playback/daily")
+    async def playback_daily(date: str, track_id: str | None = None, index: int | None = None):
+        return engine.playback.play_daily(date, track_id=track_id, index=index)
 
     return app

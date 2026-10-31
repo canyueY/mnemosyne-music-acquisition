@@ -63,6 +63,18 @@
 <body>
   <h1>Music Acquisition Monitor</h1>
   <p class="sub">最小运维页 · 读 <code>/api/music/v1/monitor/snapshot</code> · 不写 likes</p>
+  <label>管理密钥 <input id="apiToken" type="password" autocomplete="off" placeholder="仅本页内存中使用" /></label>
+  <section class="card" style="margin:16px 0">
+    <h2>账号与数据授权</h2>
+    <p>先连接网易云账号，再选择采集范围和数据用途。所有选项默认关闭。</p>
+    <button id="login">连接网易云</button> <button id="checkLogin">检查扫码状态</button>
+    <button id="cancelLogin">取消扫码</button> <button id="revoke">撤销账号授权</button>
+    <div><img id="qr" alt="扫码授权二维码" style="display:none;width:220px;height:220px;margin:12px" /></div>
+    <fieldset id="scopes"><legend>采集范围</legend></fieldset>
+    <fieldset id="purposes"><legend>数据用途</legend></fieldset>
+    <button id="grant">保存所选范围与 Consent</button> <button id="sync">同步已授权数据</button>
+    <pre id="actionStatus" aria-live="polite"></pre>
+  </section>
   <div class="row">
     <div class="card"><h2>Version</h2><div class="val" id="ver">—</div></div>
     <div class="card"><h2>Auth</h2><div class="val" id="auth">—</div></div>
@@ -73,12 +85,77 @@
   <p><button type="button" id="refresh">刷新</button> <span class="err" id="err"></span></p>
   <pre id="raw">loading…</pre>
   <script>
+    let context = null, challenge = null, currentSubject = null;
+    const scopeLabels = {"music.profile.basic":"基础资料", "music.library.liked_songs":"喜欢列表", "music.library.playlists":"歌单目录", "music.library.playlist_tracks":"歌单曲目", "music.recommend.daily_songs":"每日歌曲", "music.recommend.daily_playlists":"每日歌单（按能力支持）", "music.history.playback":"播放记录", "music.library.favorite_artists":"收藏歌手", "music.playback.control":"播放控制"};
+    const purposeLabels = {"music.data.read":"读取", "music.data.cache":"本地缓存", "music.data.submit_evidence":"向 Mnemosyne 提交证据", "music.data.create_memory":"创建长期记忆", "music.data.recall":"检索", "music.data.export":"导出", "music.data.delete":"删除"};
+    function options(id, labels) {
+      for (const [value, text] of Object.entries(labels)) {
+        const label = document.createElement("label"), input = document.createElement("input");
+        input.type = "checkbox"; input.value = value; label.append(input, document.createTextNode(text + " "));
+        document.getElementById(id).append(label);
+      }
+    }
+    options("scopes", scopeLabels); options("purposes", purposeLabels);
+    async function call(path, method="GET", body=null, headers={}) {
+      const token = document.getElementById("apiToken").value;
+      if (!token) throw new Error("请先输入管理密钥");
+      const response = await fetch("/api/music/v1/" + path, {method, headers:{Authorization:"Bearer " + token, "Content-Type":"application/json", ...headers}, ...(body ? {body:JSON.stringify(body)} : {})});
+      if (!response.ok) throw new Error("操作未完成，HTTP " + response.status);
+      return response.json();
+    }
+    async function act(task) {
+      try { const result = await task(); document.getElementById("actionStatus").textContent = JSON.stringify(result, null, 2); await load(); }
+      catch (error) { document.getElementById("actionStatus").textContent = String(error); }
+    }
+    async function getContext() { context = await call("admin/context"); return context; }
+    document.getElementById("login").onclick = () => act(async () => {
+      const ctx = await getContext();
+      challenge = await call("auth/sessions", "POST", {owner_user_id:ctx.owner_user_id, node_id:ctx.node_id});
+      const image = document.getElementById("qr");
+      if (challenge.qr_image_data && challenge.qr_image_data.startsWith("data:image/png;base64,")) { image.src=challenge.qr_image_data; image.style.display="inline"; }
+      return {status:challenge.status, expires_at:challenge.expires_at};
+    });
+    document.getElementById("checkLogin").onclick = () => act(async () => {
+      if (!challenge) throw new Error("请先创建扫码会话");
+      const result = await call("auth/sessions/" + encodeURIComponent(challenge.session_id), "GET", null, {"X-Music-Session-Nonce":challenge.state_nonce});
+      if (["authorized","valid","expired","cancelled","failed"].includes(result.status)) document.getElementById("qr").style.display="none";
+      return result;
+    });
+    document.getElementById("cancelLogin").onclick = () => act(async () => {
+      if (!challenge) throw new Error("当前没有扫码会话");
+      const result = await call("auth/sessions/" + encodeURIComponent(challenge.session_id) + "/cancel", "POST", null, {"X-Music-Session-Nonce":challenge.state_nonce});
+      challenge=null; document.getElementById("qr").style.display="none"; return result;
+    });
+    document.getElementById("revoke").onclick = () => act(async () => {
+      if (!currentSubject) throw new Error("请刷新账号状态后再撤销");
+      const result = await call("auth/revoke?subject_id=" + encodeURIComponent(currentSubject), "POST");
+      challenge=null; document.getElementById("qr").style.display="none"; return result;
+    });
+    document.getElementById("grant").onclick = () => act(async () => {
+      const ctx = await getContext();
+      const selected = id => Array.from(document.querySelectorAll("#" + id + " input:checked"), input => input.value);
+      const scopes=selected("scopes"), purposes=selected("purposes");
+      await call("scopes", "PUT", {owner_user_id:ctx.owner_user_id, scopes, purposes});
+      return call("consent", "POST", {consent_id:crypto.randomUUID(), owner_user_id:ctx.owner_user_id, node_id:ctx.node_id,
+        scopes, purposes, granted_at:new Date().toISOString(), expires_at:new Date(Date.now()+30*86400000).toISOString()});
+    });
+    document.getElementById("sync").onclick = () => act(async () => {
+      const ctx = await getContext();
+      const map={"music.profile.basic":"profile","music.library.liked_songs":"liked_songs","music.library.playlists":"playlists","music.library.playlist_tracks":"playlist_tracks","music.recommend.daily_songs":"daily_songs","music.recommend.daily_playlists":"daily_playlists","music.history.playback":"playback_history","music.library.favorite_artists":"favorite_artists"};
+      const collectors=ctx.scopes.filter(scope=>map[scope]).map(scope=>map[scope]);
+      if (!collectors.length) throw new Error("请先选择采集范围，并明确授权读取及本地缓存");
+      return call("acquisition/sync", "POST", {owner_user_id:ctx.owner_user_id, collectors});
+    });
     async function load() {
       const err = document.getElementById("err");
       err.textContent = "";
       try {
-        const r = await fetch("/api/music/v1/monitor/snapshot");
+        const token = document.getElementById("apiToken").value;
+        if (!token) { err.textContent = "请输入管理密钥后刷新"; return; }
+        const r = await fetch("/api/music/v1/monitor/snapshot", {headers: {Authorization: "Bearer " + token}});
+        if (!r.ok) throw new Error("HTTP " + r.status);
         const j = await r.json();
+        currentSubject = j.auth && j.auth.subject_id;
         document.getElementById("ver").textContent = j.version || "—";
         const st = (j.auth && (j.auth.status || j.auth.auth_status)) || "—";
         const authEl = document.getElementById("auth");

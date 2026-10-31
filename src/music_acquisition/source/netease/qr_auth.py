@@ -9,6 +9,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
+from music_acquisition.source.http_error import SourceHttpError
 
 QR_UNIKEY = "https://music.163.com/api/login/qrcode/unikey"
 QR_CHECK = "https://music.163.com/api/login/qrcode/client/login"
@@ -48,8 +49,9 @@ def _request(
     full = f"{url}?{q}" if q else url
     headers = dict(_BASE_HEADERS)
     base_cookie = "os=pc; appver=2.9.8;"
-    headers["Cookie"] = f"{base_cookie} {cookie}".strip() if cookie else base_cookie
+    credential = f"{base_cookie} {cookie}".strip() if cookie else base_cookie
     req = urllib.request.Request(full, headers=headers, method=method)
+    req.add_unredirected_header("Cookie", credential)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -61,11 +63,13 @@ def _request(
             joined = "; ".join(_cookie_pair(c) for c in raw_sc if c)
             return body if isinstance(body, dict) else {"raw": body}, joined
     except urllib.error.HTTPError as exc:
+        if exc.code == 429 or exc.code >= 500:
+            raise SourceHttpError(exc.code, exc.headers.get("Retry-After") if exc.headers else None) from exc
         detail = exc.read().decode("utf-8", errors="replace")[:300]
         try:
             body = json.loads(detail)
         except json.JSONDecodeError:
-            body = {"code": exc.code, "message": detail}
+            body = {"code": exc.code, "message": "HTTP_ERROR"}
         return body, ""
 
 
@@ -77,7 +81,7 @@ def _cookie_pair(set_cookie: str) -> str:
 def create_qr_session() -> QrSession:
     body, _ = _request(QR_UNIKEY, params={"type": "1"})
     if int(body.get("code") or 0) != 200 or not body.get("unikey"):
-        raise RuntimeError(f"qr_unikey_failed:{body}")
+        raise RuntimeError("QR_UNIKEY_FAILED")
     unikey = str(body["unikey"])
     # NetEase mobile app scans this URL form
     scan_url = f"https://music.163.com/login?codekey={unikey}"

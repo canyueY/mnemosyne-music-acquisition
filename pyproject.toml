@@ -14,10 +14,12 @@ keywords = ["mnemosyne", "music", "netease", "acquisition", "agent"]
 dependencies = [
   "pydantic>=2.7.0",
   "cryptography>=42.0.0",
+  "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+build = ["pyinstaller>=6.0"]
 http = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.0", "httpx>=0.27.0"]
 qr = ["qrcode[pil]>=7.4"]
 secure = ["keyring>=25.0"]
@@ -37,6 +39,9 @@ Documentation = "docs/ARCHITECTURE.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+music_acquisition = ["resources/*.json", "resources/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

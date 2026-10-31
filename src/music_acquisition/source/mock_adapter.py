@@ -59,6 +59,7 @@ class MockNeteaseAdapter:
             },
             limitations=["mock_adapter", "no_real_network"],
             verified_at=_now(),
+            verification_status="verified_synthetic",
         )
 
     async def begin_authorization(self) -> AuthorizationChallenge:

@@ -1,0 +1,73 @@
+{
+  "component_id": "mnemosyne.music-acquisition",
+  "name": "Mnemosyne Music Acquisition",
+  "version": "0.5.0",
+  "type": "provider",
+  "provider": "official",
+  "interfaces": {
+    "provides": [
+      "music.auth",
+      "music.acquisition",
+      "music.sync",
+      "music.snapshots",
+      "music.playback.optional",
+      "music.memory.submit",
+      "music.domain.pack"
+    ],
+    "requires": [
+      "host.runtime",
+      "mnemosyne.service.optional"
+    ]
+  },
+  "protocols": [
+    "mnemosyne-component-v1",
+    "music-acquisition-v1"
+  ],
+  "permissions": [
+    "music.profile.basic",
+    "music.library.liked_songs",
+    "music.library.playlists",
+    "music.library.playlist_tracks",
+    "music.library.favorite_artists",
+    "music.recommend.daily_songs",
+    "music.recommend.daily_playlists",
+    "music.history.playback",
+    "music.playback.control"
+  ],
+  "domain_packs": [
+    "domain/music_domain_pack.v1.json"
+  ],
+  "compatibility": {
+    "mnemosyne": ">=2.0.0"
+  },
+  "lifecycle": {
+    "health_check": true,
+    "config_schema": true
+  },
+  "entry": {
+    "package": "music_acquisition",
+    "cli": "mnemosyne-music",
+    "http": "/api/music/v1",
+    "standalone": {
+      "executable": "mnemosyne-music.exe",
+      "arguments": [
+        "serve"
+      ],
+      "host_provides_env": [
+        "MNEMOSYNE_MUSIC_API_TOKEN",
+        "MNEMOSYNE_MUSIC_AGENT_TOKEN",
+        "MNEMOSYNE_BASE_URL",
+        "DSH_MEMORY_TOKEN"
+      ]
+    },
+    "mcp": {
+      "arguments": [
+        "mcp",
+        "--url",
+        "http://127.0.0.1:8770"
+      ],
+      "protocol_version": "2025-06-18"
+    }
+  },
+  "notes": "Mnemosyne first-party component; platform endpoints are external web interfaces. Scopes default off; collection requires account authorization and explicit Consent. Agent tools cannot grant Consent."
+}
